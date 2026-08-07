@@ -1,0 +1,15 @@
+# Never commit these -- they contain your Telegram credentials and live trade state
+config.py
+trade_state.json
+alerted_state.json
+leaderboard.json
+scanner.log
+
+# Python
+__pycache__/
+*.pyc
+venv/
+.venv/
+
+# Streamlit
+.streamlit/
