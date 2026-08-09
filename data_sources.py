@@ -71,7 +71,7 @@ WATCHLISTS = {
     ],
     "INDIA": [
         "RELIANCE.NS", "TCS.NS", "HDFCBANK.NS", "INFY.NS", "ICICIBANK.NS",
-        "SBIN.NS", "BHARTIARTL.NS", "ITC.NS", "LT.NS", "TATAMOTORS.NS",
+        "SBIN.NS", "BHARTIARTL.NS", "ITC.NS", "LT.NS", "TMPV.NS",
     ],
     "FOREX": [
         "AUDUSD=X", "EURUSD=X", "GBPUSD=X", "USDJPY=X",
