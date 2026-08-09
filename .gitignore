@@ -1,8 +1,8 @@
-# Never commit these -- they contain your Telegram credentials and live trade state
-config.py
-trade_state.json
-alerted_state.json
-leaderboard.json
+# config.py no longer contains real secrets (Telegram token/chat ID are read
+# from environment variables / GitHub Actions secrets instead) so it's safe
+# to commit. trade_state.json / leaderboard.json are intentionally tracked
+# too -- the GitHub Actions scanner workflow commits them back to the repo
+# after each run so it remembers state between scans.
 scanner.log
 
 # Python

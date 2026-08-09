@@ -107,17 +107,25 @@ tab shows the same state visually.
 
 
 
-## Using GitHub (optional)
+## Deployment: GitHub Actions + Render (no VM needed)
 
-GitHub is not required -- you can just copy the folder straight to your VM
-(scp, or re-download the zip there). It's only useful if you want `git
-pull` to sync future edits instead of re-uploading each time.
+GitHub is now central to running this, not optional -- see
+`DEPLOYMENT.md` for full step-by-step instructions. The short version:
 
-If you do use it: **never commit `config.py`** -- it holds your Telegram
-bot token. The included `.gitignore` already excludes `config.py`,
-`trade_state.json`, and `alerted_state.json`. Commit `config.example.py`
-instead, and on each machine copy it to `config.py` and fill in your real
-credentials there (which stays untracked).
+- **Scanner**: runs on **GitHub Actions** (`.github/workflows/scanner.yml`),
+  triggered hourly by GitHub's own free scheduler. No VM, no server, no
+  networking configuration. Your Telegram token/chat ID are stored as
+  **GitHub Actions secrets** (Settings -> Secrets and variables -> Actions),
+  read via environment variables in `config.py` -- never committed as
+  plaintext. The workflow commits `trade_state.json` and `leaderboard.json`
+  back to the repo after each run so state persists between scans.
+- **Dashboard** (optional): deploy to **Render** by connecting your GitHub
+  repo through their website -- they build and host it automatically,
+  free tier available.
+
+This means `config.py` is safe to commit now (it no longer hardcodes
+secrets), unlike earlier versions of this project that assumed a
+self-managed VM with a local `config.py` holding the real token.
 
 ## Time-to-target estimates
 

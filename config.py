@@ -8,8 +8,14 @@ the codebase should need touching for day-to-day adjustments.
 # 2. Message your new bot once (anything), then visit:
 #    https://api.telegram.org/bot<TOKEN>/getUpdates
 #    and copy the "chat":{"id": ...} value into TELEGRAM_CHAT_ID.
-TELEGRAM_BOT_TOKEN = "PASTE_YOUR_BOT_TOKEN_HERE"
-TELEGRAM_CHAT_ID = "PASTE_YOUR_CHAT_ID_HERE"
+#
+# These read from environment variables first (set as GitHub Actions
+# secrets when running in the cloud -- see .github/workflows/scanner.yml),
+# falling back to the placeholder strings below for local testing. This
+# means your real token never needs to be committed to the repo.
+import os
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "PASTE_YOUR_BOT_TOKEN_HERE")
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "PASTE_YOUR_CHAT_ID_HERE")
 
 # --- Scanning ---------------------------------------------------------------
 # Timeframe per market. Harmonic patterns are structural -- 1h/4h/1d give
