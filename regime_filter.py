@@ -65,16 +65,39 @@ def check_volume_regime(df: pd.DataFrame, lookback: int = 60, dry_up_threshold: 
 def check_volatility_regime(df: pd.DataFrame, atr_series: pd.Series, lookback: int = 100,
                              extreme_percentile: float = 90.0) -> dict:
     """
-    Flags if current ATR is in an extreme percentile of its recent history
-    -- either a volatility blowout (stops get run, targets get skipped
-    past) or, less commonly, historically compressed (pattern may be too
-    small to be tradeable after costs).
+    Flags if current volatility is in an extreme percentile of its recent
+    history -- either a blowout (stops get run, targets get skipped past)
+    or, less commonly, historically compressed (pattern may be too small
+    to be tradeable after costs).
+
+    Uses ATR as a % of price (not raw dollar ATR) so the comparison isn't
+    biased by the instrument's price level drifting over the lookback
+    window -- a stock that's simply risen in price over the year will have
+    a naturally rising *dollar* ATR even with unchanged *percentage*
+    volatility, which would otherwise show up as a false "elevated
+    volatility" flag on every trending instrument, not a real regime change.
     """
     if atr_series is None or len(atr_series.dropna()) < lookback:
         return {"flag": None, "note": "Not enough ATR history to assess."}
-    recent_window = atr_series.dropna().iloc[-lookback:]
-    current_atr = recent_window.iloc[-1]
-    pct = (recent_window < current_atr).mean() * 100
+
+    atr_pct = (atr_series / df['Close']).dropna()
+    if len(atr_pct) < lookback:
+        return {"flag": None, "note": "Not enough ATR history to assess."}
+
+    recent_window = atr_pct.iloc[-lookback:]
+    current_val = recent_window.iloc[-1]
+
+    # guard against a single incomplete/partial "today" bar (e.g. fetched
+    # mid-session) distorting the reading -- if the current bar's ATR%
+    # is a wild multiple of the window's own median, treat it as unreliable
+    # data rather than a real volatility regime call
+    median_val = recent_window.median()
+    if median_val > 0 and current_val > median_val * 4:
+        return {"flag": None, "note": "Latest bar's volatility reading looks anomalous "
+                                       "(possibly an incomplete/partial bar) -- skipping the volatility check "
+                                       "rather than risk a false signal."}
+
+    pct = (recent_window < current_val).mean() * 100
 
     if pct >= extreme_percentile:
         return {"flag": "high", "percentile": round(float(pct), 1),
@@ -86,7 +109,6 @@ def check_volatility_regime(df: pd.DataFrame, atr_series: pd.Series, lookback: i
                         f"targets may be too tight to clear transaction costs."}
     return {"flag": None, "percentile": round(float(pct), 1),
             "note": f"Volatility is in normal range ({pct:.0f}th percentile)."}
-
 
 def assess_regime(df: pd.DataFrame, atr_series: pd.Series = None) -> dict:
     """Combined regime check -- call this once per scan per ticker."""
