@@ -139,16 +139,32 @@ def scan_ticker(market: str, ticker: str, state: dict, board: dict) -> int:
         entry_deviation_pct = abs(current_price - entry) / entry * 100 if entry else 0
         price_still_actionable = entry_deviation_pct <= config.MAX_ENTRY_DEVIATION_PCT
 
-        # gate entry_ready further: regime must be OK, and price must still
-        # be actionable -- checked BEFORE calling update_setup so a bad
-        # regime/stale price prevents a brand new ENTER_NOW from ever being
-        # created (existing open trades still get their exits processed
-        # normally regardless)
+        # gate entry_ready: regime must be OK AND price must still be
+        # actionable -- applied on EVERY scan, not just when the setup is
+        # first created. This is critical: a pattern can sit in
+        # AWAITING_CONFIRMATION for many scan cycles while price drifts
+        # away, and only get its candlestick/momentum confirmation much
+        # later. Without re-checking staleness on every scan (not just at
+        # creation), a setup that was fresh when first spotted but is now
+        # stale by the time it finally "confirms" would incorrectly fire
+        # ENTER_NOW regardless of how far price has since moved.
         gated_conf = dict(conf)
-        if not regime_ok and setup_id not in state:
+        if not regime_ok:
             gated_conf["entry_ready"] = False
-        if not price_still_actionable and setup_id not in state:
+        if not price_still_actionable:
             gated_conf["entry_ready"] = False
+
+        # if an already-tracked setup has drifted too stale to ever be
+        # actionable again, close it out explicitly instead of leaving it
+        # stuck silently in AWAITING_CONFIRMATION/WATCHING forever
+        existing_setup = state.get(setup_id)
+        if existing_setup and existing_setup["status"] in ("AWAITING_CONFIRMATION", "WATCHING"):
+            if bars_old > config.MAX_PATTERN_AGE_BARS or not price_still_actionable:
+                existing_setup["status"] = "CLOSED_INVALIDATED"
+                existing_setup["last_update"] = datetime.now(timezone.utc).isoformat()
+                print(f"[{datetime.now(timezone.utc).isoformat()}] EXPIRED (stale) {market} {ticker} {p.name}: "
+                      f"bars_old={bars_old} price_dev={entry_deviation_pct:.2f}%")
+                continue
 
         result = tm.update_setup(state, setup_id, market, ticker, tf, p, gated_conf,
                                   current_price, entry, stop, t1, t2, t3, atr=current_atr,
