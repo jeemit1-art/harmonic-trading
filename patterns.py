@@ -316,10 +316,19 @@ def find_patterns(df: pd.DataFrame, deviation_pct: float = 3.0,
             # different D completions all get accepted as long as the
             # earlier legs happen to match, which is how the same price
             # structure was previously getting classified as multiple
-            # different, contradictory patterns at once. Not checked for
-            # measured_from_xc patterns (Cypher/Shark) since their D is
-            # already validated via cd_xc above instead.
-            if not rule.measured_from_xc and not rule.ad_xa.contains(ad_xa, tolerance):
+            # different, contradictory patterns at once.
+            #
+            # Cypher's ad_xa is a genuine placeholder (0.0-0.0, unused --
+            # its D is fully defined by cd_xc alone) so it's correctly
+            # skipped. Shark is DIFFERENT: its own rule explicitly defines
+            # a real ad_xa range (0.886-1.13) and its notes say to check
+            # D against BOTH cd_xc and ad_xa as confluence -- skipping it
+            # for Shark (as an earlier version of this code mistakenly did,
+            # grouping it with Cypher just because both use
+            # measured_from_xc) meant Shark matches were only being
+            # validated against half their defining criteria.
+            ad_xa_is_meaningful = not (rule.ad_xa.lo == 0.0 and rule.ad_xa.hi == 0.0)
+            if ad_xa_is_meaningful and not rule.ad_xa.contains(ad_xa, tolerance):
                 continue
 
             # PRZ: project D from both the XA ratio and the CD/XC ratio for confluence
