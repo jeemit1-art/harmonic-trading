@@ -18,16 +18,16 @@ from matplotlib.patches import Rectangle
 import pandas as pd
 import numpy as np
 
-BG = "#0B0E13"
-PANEL = "#12161F"
-GRID = "#232938"
-TEXT = "#E7EAF1"
-MUTED = "#7C8598"
-BULL = "#26D98C"
-BEAR = "#FF5C6C"
-GOLD = "#F5A623"
-VIOLET = "#9C8CFF"
-BLUE = "#4DABF7"
+BG = "#0A0D12"
+PANEL = "#10141B"
+GRID = "#232A38"
+TEXT = "#E7E9EE"
+MUTED = "#8890A2"
+BULL = "#4FB0A2"
+BEAR = "#E2685F"
+GOLD = "#C9A45C"
+VIOLET = "#8F7CE8"
+BLUE = "#6C9BD1"
 
 
 def _draw_candles(ax, df: pd.DataFrame):

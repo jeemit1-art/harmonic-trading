@@ -36,7 +36,7 @@ from patterns import find_patterns
 from confluence import score_confluence
 from telegram_alert import (send_telegram_message, format_pattern_alert, format_action_alert,
                              send_telegram_photo, format_enter_now_caption)
-from backtest import _atr, estimate_time_to_targets
+from backtest import _atr, estimate_time_to_targets, _blended_r
 import trade_manager as tm
 import leaderboard as lb
 import correlation as corr
@@ -231,15 +231,23 @@ def scan_ticker(market: str, ticker: str, state: dict, board: dict) -> int:
                   f"{'sent' if ok else 'queued (no telegram)'}")
 
             if action in CLOSED_ACTIONS:
-                # record the realized outcome to the leaderboard. Approximate
-                # the closed trade's blended R the same way the backtester
-                # does isn't available live without re-deriving it exactly,
-                # so use the fraction-weighted price move vs initial risk as
-                # a reasonable live proxy.
-                initial_risk = abs(setup["entry"] - setup.get("original_stop", setup["entry"]))
+                # Record the realized outcome to the leaderboard, using the
+                # SAME blended-R methodology as the backtester (backtest._blended_r)
+                # so live stats are actually comparable to the backtest-seeded
+                # stats they sit alongside in leaderboard.json -- not just a
+                # single price-move proxy that ignores profit already banked
+                # at T1/T2, and not today's close when the actual fill was a
+                # stop or target level recorded in the setup.
+                original_stop = setup.get("original_stop", setup["entry"])
+                initial_risk = abs(setup["entry"] - original_stop)
                 if initial_risk > 0:
-                    sign = 1 if bullish else -1
-                    approx_r = sign * (current_price - setup["entry"]) / initial_risk
+                    exit_price = setup.get("exit_price", current_price)
+                    stop_hit = action in ("EXIT_STOP", "EXIT_TRAILING_STOP")
+                    approx_r = _blended_r(
+                        hit_t1=bool(setup.get("hit_t1")), hit_t2=bool(setup.get("hit_t2")),
+                        stop_hit=stop_hit, risk=initial_risk, entry=setup["entry"],
+                        t1=setup["t1"], t2=setup["t2"], exit_price=exit_price, bullish=bullish,
+                    )
                     board = lb.record_outcome(board, market, ticker, p.name, approx_r, source="live")
 
         elif action == "SETUP_INVALIDATED":

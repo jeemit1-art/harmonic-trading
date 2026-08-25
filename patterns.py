@@ -252,11 +252,17 @@ def _ratio(p1: Pivot, p2: Pivot, p3: Pivot, p4: Pivot) -> float:
     return leg2 / leg1
 
 
-def _quality_score(rule: PatternRule, ab_xa, bc_ab, cd_leg) -> float:
+def _quality_score(rule: PatternRule, ab_xa, bc_ab, cd_leg=None) -> float:
     """
     Score how close the actual ratios are to the IDEAL (midpoint) Fibonacci
     numbers for this pattern, not just "inside the tolerance band".
     Tighter confluence at D = historically higher win rate.
+
+    cd_leg is optional: for a still-forming pattern (no D pivot yet) there
+    is no real CD ratio to score, so the score is based on AB/XA and BC/AB
+    only. Passing a fabricated cd_leg here would score it against the
+    CD/BC or CD/XC range and produce a misleadingly low number -- always
+    omit cd_leg rather than substitute another ratio for it.
     """
     def closeness(val, rng: RatioRange) -> float:
         mid = (rng.lo + rng.hi) / 2
@@ -264,10 +270,11 @@ def _quality_score(rule: PatternRule, ab_xa, bc_ab, cd_leg) -> float:
         return max(0.0, 1 - abs(val - mid) / (span * 2))
 
     scores = [closeness(ab_xa, rule.ab_xa), closeness(bc_ab, rule.bc_ab)]
-    if rule.measured_from_xc:
-        scores.append(closeness(cd_leg, rule.cd_xc))
-    else:
-        scores.append(closeness(cd_leg, rule.cd_bc))
+    if cd_leg is not None:
+        if rule.measured_from_xc:
+            scores.append(closeness(cd_leg, rule.cd_xc))
+        else:
+            scores.append(closeness(cd_leg, rule.cd_bc))
     return round(float(np.mean(scores)) * 100, 1)
 
 
@@ -354,7 +361,6 @@ def find_patterns(df: pd.DataFrame, deviation_pct: float = 3.0,
 
             q = _quality_score(rule, ab_xa, bc_ab, cd_leg)
 
-            is_last_leg = (D.index >= last_idx - 3)  # D pivot is recent -> confirmed recently
             confirmed = True
 
             pat = HarmonicPattern(
@@ -397,7 +403,7 @@ def find_patterns(df: pd.DataFrame, deviation_pct: float = 3.0,
                         prz_lo=prz_lo, prz_hi=prz_hi,
                         ratios={"AB/XA": round(ab_xa, 3), "BC/AB": round(bc_ab, 3)},
                         confirmed=False,
-                        quality_score=_quality_score(rule, ab_xa, bc_ab, bc_ab),
+                        quality_score=_quality_score(rule, ab_xa, bc_ab),
                     )
                     results.append(pat)
 

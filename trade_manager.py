@@ -176,6 +176,7 @@ def update_setup(state: dict, setup_id: str, market: str, ticker: str, timeframe
             if hit_t1:
                 existing["status"] = "PARTIAL_T1"
                 existing["fraction_remaining"] = 0.667
+                existing["hit_t1"] = True
                 existing["stop"] = existing["entry"]  # move to breakeven
                 return {"action": "EXIT_PARTIAL_T1", "setup": existing}
 
@@ -184,6 +185,7 @@ def update_setup(state: dict, setup_id: str, market: str, ticker: str, timeframe
             if hit_t2:
                 existing["status"] = "PARTIAL_T2"
                 existing["fraction_remaining"] = 0.333
+                existing["hit_t2"] = True
                 if use_trailing:
                     trail_mult = getattr(config, "TRAILING_ATR_MULT", 1.5)
                     candidate = (current_price - atr * trail_mult) if bullish else (current_price + atr * trail_mult)
@@ -196,6 +198,7 @@ def update_setup(state: dict, setup_id: str, market: str, ticker: str, timeframe
             if hit_t3:
                 existing["status"] = "CLOSED_T3"
                 existing["fraction_remaining"] = 0.0
+                existing["exit_price"] = t3  # actual fill for this leg -- used for leaderboard R
                 return {"action": "EXIT_FULL_T3", "setup": existing}
 
         return {"action": None, "setup": existing}  # open, nothing new to report

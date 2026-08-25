@@ -23,55 +23,134 @@ from confluence import score_confluence, rsi
 import trade_manager as tm
 import leaderboard as lb
 
-st.set_page_config(page_title="Harmonic Trading Dashboard", layout="wide", page_icon="\U0001F4C8")
+st.set_page_config(page_title="Harmonic \u00b7 Pattern Terminal", layout="wide", page_icon="\U0001F9ED")
 
-st.markdown("""
+# ---------------------------------------------------------------------------
+# Design tokens
+# ---------------------------------------------------------------------------
+# The subject here is literally a drafting instrument: ratio-measured
+# geometry (X-A-B-C-D) laid over price. Palette and type lean into that --
+# an ink-dark ground, a brass "instrument" accent for structure/actions, and
+# desaturated teal/coral/steel for bullish/bearish/watching states (not the
+# generic single neon-on-black look). Space Grotesk carries the geometric
+# display role, Plex Sans is body text, Plex Mono is reserved for anything
+# that is a number a trader has to read precisely.
+BRAND_CSS = """
 <style>
-    html, body, [class*="css"] { font-family: -apple-system, 'Segoe UI', Inter, sans-serif; }
-    .stApp { background: #0B0E13; }
+@import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500;600&display=swap');
 
-    /* headers */
-    h1, h2, h3 { font-weight: 800 !important; letter-spacing: -0.01em; }
-    h1 { background: linear-gradient(90deg, #F5A623, #9C8CFF);
-         -webkit-background-clip: text; -webkit-text-fill-color: transparent;
-         display: inline-block; }
+:root {
+    --bg: #0A0D12;
+    --panel: #10141B;
+    --panel-2: #151B24;
+    --border: #232A38;
+    --text: #E7E9EE;
+    --muted: #8890A2;
+    --brass: #C9A45C;
+    --brass-dim: #8C6F3E;
+    --teal: #4FB0A2;
+    --coral: #E2685F;
+    --steel: #6C9BD1;
+}
 
-    /* tabs */
-    .stTabs [data-baseweb="tab-list"] { gap: 6px; }
-    .stTabs [data-baseweb="tab"] {
-        background: #12161F; border-radius: 8px 8px 0 0; padding: 10px 18px;
-        color: #7C8598; font-weight: 600; border: 1px solid #232938; border-bottom: none;
-    }
-    .stTabs [aria-selected="true"] { background: #171C27 !important; color: #E7EAF1 !important; }
+html, body, [class*="css"] { font-family: 'IBM Plex Sans', -apple-system, 'Segoe UI', sans-serif; }
+.stApp { background: var(--bg); }
+.block-container { padding-top: 1.4rem; max-width: 1400px; }
 
-    /* metrics */
-    [data-testid="stMetric"] {
-        background: #12161F; border: 1px solid #232938; border-radius: 10px;
-        padding: 12px 16px;
-    }
-    [data-testid="stMetricValue"] { font-family: 'SFMono-Regular', Consolas, monospace; font-weight: 700; }
+/* ---- typography ------------------------------------------------------ */
+h1, h2, h3, h4 { font-family: 'Space Grotesk', sans-serif; font-weight: 600 !important;
+                 letter-spacing: -0.01em; color: var(--text); }
+h3 { color: var(--text) !important; margin-top: 0.2em; }
+p, li, span, label { color: var(--text); }
+.stCaption, [data-testid="stCaptionContainer"] { color: var(--muted) !important; }
+code { color: var(--brass); background: var(--panel-2) !important; }
 
-    /* buttons */
-    .stButton>button {
-        background: linear-gradient(135deg, #F5A623, #c47f13); color: #1a1200;
-        font-weight: 700; border: none; border-radius: 8px;
-    }
-    .stButton>button:hover { background: linear-gradient(135deg, #ffb84d, #e0941a); color: #1a1200; }
+/* ---- masthead ---------------------------------------------------------- */
+.hpt-masthead { display: flex; align-items: center; gap: 14px; padding-bottom: 4px; }
+.hpt-wordmark { font-family: 'Space Grotesk', sans-serif; font-weight: 700; font-size: 1.7rem;
+                color: var(--text); letter-spacing: -0.01em; }
+.hpt-wordmark span { color: var(--brass); }
+.hpt-tagline { color: var(--muted); font-size: 0.86rem; margin-top: -2px; }
 
-    /* expanders (setup cards) */
-    .streamlit-expanderHeader {
-        background: #12161F; border-radius: 8px; font-weight: 600;
-    }
+/* ---- tabs: underline instrument-rail nav, not boxy browser tabs ------ */
+.stTabs [data-baseweb="tab-list"] {
+    gap: 26px; border-bottom: 1px solid var(--border); margin-bottom: 6px;
+}
+.stTabs [data-baseweb="tab"] {
+    background: transparent; padding: 8px 2px 12px 2px; color: var(--muted);
+    font-family: 'Space Grotesk', sans-serif; font-weight: 600; font-size: 0.92rem;
+    border: none; border-bottom: 2px solid transparent;
+}
+.stTabs [data-baseweb="tab"]:hover { color: var(--text); }
+.stTabs [aria-selected="true"] {
+    background: transparent !important; color: var(--brass) !important;
+    border-bottom: 2px solid var(--brass) !important;
+}
+.stTabs [data-baseweb="tab-highlight"] { background: transparent; }
+.stTabs [data-baseweb="tab-panel"] { padding-top: 18px; }
 
-    /* dataframes */
-    [data-testid="stDataFrame"] { border-radius: 8px; overflow: hidden; }
+/* ---- metrics: instrument-dial cards ----------------------------------- */
+[data-testid="stMetric"] {
+    background: var(--panel); border: 1px solid var(--border); border-radius: 6px;
+    padding: 12px 16px; border-top: 2px solid var(--brass-dim);
+}
+[data-testid="stMetricLabel"] { color: var(--muted) !important; font-size: 0.72rem !important;
+    text-transform: uppercase; letter-spacing: 0.06em; font-weight: 600 !important; }
+[data-testid="stMetricValue"] { font-family: 'IBM Plex Mono', 'SFMono-Regular', monospace !important;
+    font-weight: 600 !important; color: var(--text) !important; }
 
-    /* number/text inputs, selects */
-    .stTextInput input, .stNumberInput input, .stSelectbox div[data-baseweb="select"] {
-        background: #12161F !important; border-color: #232938 !important;
-    }
+/* ---- buttons ----------------------------------------------------------- */
+.stButton>button {
+    background: var(--brass); color: #17130A; font-family: 'Space Grotesk', sans-serif;
+    font-weight: 600; border: none; border-radius: 5px; letter-spacing: 0.01em;
+}
+.stButton>button:hover { background: #DBB56E; color: #17130A; }
+.stButton>button[kind="secondary"] { background: var(--panel-2); color: var(--text);
+    border: 1px solid var(--border); }
+
+/* ---- expanders (setup / trade-plan cards) ------------------------------ */
+.streamlit-expanderHeader, [data-testid="stExpander"] summary {
+    background: var(--panel) !important; border: 1px solid var(--border) !important;
+    border-radius: 6px; font-family: 'Space Grotesk', sans-serif; font-weight: 600 !important;
+}
+[data-testid="stExpander"] { border: none !important; }
+[data-testid="stExpanderDetails"] { background: var(--panel); border: 1px solid var(--border);
+    border-top: none; border-radius: 0 0 6px 6px; padding: 4px 6px; }
+
+/* ---- dataframes / tables ------------------------------------------------ */
+[data-testid="stDataFrame"] { border-radius: 6px; overflow: hidden; border: 1px solid var(--border); }
+
+/* ---- inputs -------------------------------------------------------------- */
+.stTextInput input, .stNumberInput input, .stSelectbox div[data-baseweb="select"] > div {
+    background: var(--panel) !important; border-color: var(--border) !important;
+    color: var(--text) !important; border-radius: 5px !important;
+}
+.stSlider [data-baseweb="slider"] div[role="slider"] { background: var(--brass) !important; }
+.stCheckbox label { color: var(--text) !important; }
+
+/* ---- alerts / info boxes -------------------------------------------------- */
+[data-testid="stAlertContentInfo"] { color: var(--text); }
+div[data-baseweb="notification"] { border-radius: 6px; }
+
+/* ---- dividers -------------------------------------------------------------- */
+hr { border-color: var(--border) !important; }
 </style>
-""", unsafe_allow_html=True)
+"""
+st.markdown(BRAND_CSS, unsafe_allow_html=True)
+
+# small hand-drawn X-A-B-C-D zigzag -- the app's one signature mark, echoed
+# nowhere else so it stays a mark rather than a decoration
+ZIGZAG_MARK = """
+<svg width="34" height="28" viewBox="0 0 34 28" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <polyline points="2,22 9,6 16,18 24,4 32,20" stroke="#C9A45C" stroke-width="2.2"
+            stroke-linecap="round" stroke-linejoin="round" fill="none"/>
+  <circle cx="2" cy="22" r="2" fill="#6C9BD1"/>
+  <circle cx="9" cy="6" r="2" fill="#E2685F"/>
+  <circle cx="16" cy="18" r="2" fill="#6C9BD1"/>
+  <circle cx="24" cy="4" r="2" fill="#E2685F"/>
+  <circle cx="32" cy="20" r="2.4" fill="#C9A45C"/>
+</svg>
+"""
 
 MARKET_TICKERS = WATCHLISTS
 TIMEFRAME_OPTIONS = ["15m", "30m", "1h", "4h", "1d"]
@@ -84,13 +163,13 @@ def plot_chart(df: pd.DataFrame, patterns: list, title: str = "", atr_series: pd
 
     fig.add_trace(go.Candlestick(
         x=df.index, open=df['Open'], high=df['High'], low=df['Low'], close=df['Close'],
-        name="Price", increasing_line_color="#26a69a", decreasing_line_color="#ef5350",
+        name="Price", increasing_line_color="#4FB0A2", decreasing_line_color="#E2685F",
         hovertext=[f"Open: {o:.4f}<br>High: {h:.4f}<br>Low: {l:.4f}<br>Close: {c:.4f}"
                    for o, h, l, c in zip(df['Open'], df['High'], df['Low'], df['Close'])],
         hoverinfo="x+text"
     ), row=1, col=1)
 
-    colors = ["#f5a623", "#7b61ff", "#00c2a8", "#ff6b6b", "#4dabf7", "#c084fc", "#20c997"]
+    colors = ["#C9A45C", "#6C9BD1", "#4FB0A2", "#E2685F", "#8F7CE8", "#D68FC9", "#7FC97F"]
 
     def _mid(p1, p2):
         return p1.timestamp + (p2.timestamp - p1.timestamp) / 2, (p1.price + p2.price) / 2
@@ -165,29 +244,31 @@ def plot_chart(df: pd.DataFrame, patterns: list, title: str = "", atr_series: pd
             t2 = entry + 0.618 * cd_leg if bullish else entry - 0.618 * cd_leg
             t3 = p.A.price
 
-            fig.add_hline(y=stop, line=dict(color="#ff5c6c", width=1.3), row=1, col=1,
+            fig.add_hline(y=stop, line=dict(color="#E2685F", width=1.3), row=1, col=1,
                           annotation_text=f"Stop: {stop:.4f}", annotation_position="left",
-                          annotation_font=dict(color="#ff5c6c", size=11))
+                          annotation_font=dict(color="#E2685F", size=11))
             fig.add_hline(y=entry, line=dict(color=color, width=1.3, dash="dot"), row=1, col=1,
                           annotation_text=f"Entry: {entry:.4f}", annotation_position="left",
                           annotation_font=dict(color=color, size=11))
             for label, val in [("Target 1", t1), ("Target 2", t2), ("Target 3", t3)]:
-                fig.add_hline(y=val, line=dict(color="#26d98c", width=1.1), row=1, col=1,
+                fig.add_hline(y=val, line=dict(color="#4FB0A2", width=1.1), row=1, col=1,
                               annotation_text=f"{label}: {val:.4f}", annotation_position="left",
-                              annotation_font=dict(color="#26d98c", size=10.5))
+                              annotation_font=dict(color="#4FB0A2", size=10.5))
 
             # pattern name tag near D
             fig.add_annotation(x=p.D.timestamp, y=stop if bullish else t3, text=f" {p.name} ",
-                                showarrow=False, font=dict(size=11, color="#8fc7ff"),
-                                bgcolor="rgba(18,40,63,0.9)", bordercolor="#4dabf7",
+                                showarrow=False, font=dict(size=11, color="#9FC1E8"),
+                                bgcolor="rgba(21,27,36,0.92)", bordercolor="#6C9BD1",
                                 borderwidth=1, row=1, col=1, yshift=-14 if bullish else 14)
 
     r = rsi(df['Close'])
-    fig.add_trace(go.Scatter(x=df.index, y=r, name="RSI", line=dict(color="#a78bfa")), row=2, col=1)
-    fig.add_hline(y=70, line_dash="dot", line_color="grey", row=2, col=1)
-    fig.add_hline(y=30, line_dash="dot", line_color="grey", row=2, col=1)
+    fig.add_trace(go.Scatter(x=df.index, y=r, name="RSI", line=dict(color="#8F7CE8")), row=2, col=1)
+    fig.add_hline(y=70, line_dash="dot", line_color="#4A5262", row=2, col=1)
+    fig.add_hline(y=30, line_dash="dot", line_color="#4A5262", row=2, col=1)
 
     fig.update_layout(height=750, template="plotly_dark", margin=dict(t=70, b=10, l=10, r=10),
+                       paper_bgcolor="#0A0D12", plot_bgcolor="#10141B",
+                       font=dict(family="IBM Plex Sans, sans-serif", color="#E7E9EE"),
                        legend=dict(orientation="h", y=1.03),
                        dragmode="pan",  # click-drag pans by default; scroll/pinch to zoom
                        hovermode="x unified")
@@ -201,13 +282,14 @@ def plot_chart(df: pd.DataFrame, patterns: list, title: str = "", atr_series: pd
                 dict(count=1, label="1Y", step="year", stepmode="backward"),
                 dict(step="all", label="All"),
             ],
-            bgcolor="#171C27", activecolor="#F5A623", font=dict(color="#E7EAF1", size=11),
+            bgcolor="#151B24", activecolor="#C9A45C", font=dict(color="#E7E9EE", size=11),
             y=1.18, yanchor="top",
         ),
         row=1, col=1,
     )
-    fig.update_xaxes(rangeslider=dict(visible=False), row=1, col=1)
-    fig.update_xaxes(rangeslider=dict(visible=True, thickness=0.06, bgcolor="#12161F"), row=2, col=1)
+    fig.update_xaxes(rangeslider=dict(visible=False), row=1, col=1, gridcolor="#1B212B")
+    fig.update_xaxes(rangeslider=dict(visible=True, thickness=0.06, bgcolor="#10141B"), row=2, col=1, gridcolor="#1B212B")
+    fig.update_yaxes(gridcolor="#1B212B")
     return fig
 
 
@@ -254,12 +336,20 @@ def trade_plan_box(df, p, atr_series):
 
 
 # ---------------------------------------------------------------------------
-st.title("\U0001F4C8 Harmonic Trading Dashboard")
-st.caption("AUS \u00b7 US \u00b7 India \u00b7 Forex -- Gartley, Bat, Butterfly, Crab, Deep Crab, Cypher, Shark")
+st.markdown(f"""
+<div class="hpt-masthead">
+    {ZIGZAG_MARK}
+    <div>
+        <div class="hpt-wordmark">Harmonic<span>.</span>Terminal</div>
+        <div class="hpt-tagline">AUS &middot; US &middot; India &middot; Forex &mdash; Gartley, Bat, Butterfly, Crab, Deep Crab, Cypher, Shark</div>
+    </div>
+</div>
+""", unsafe_allow_html=True)
+st.write("")
 
 tab0, tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
-    "\U0001F3E0 Live Overview", "\U0001F50D Scan Now", "\U0001F4CA Backtest", "\U0001F4CB Watchlist Scan",
-    "\U0001F4C8 Open Trades", "\U0001F3C6 Leaderboard", "\U0001F9EA Validation", "\u2699\uFE0F Settings"])
+    "Overview", "Scan", "Backtest", "Watchlist",
+    "Open Trades", "Leaderboard", "Validation", "Settings"])
 
 # --- TAB 0: Live Overview ----------------------------------------------------
 with tab0:
@@ -447,9 +537,13 @@ with tab2:
             ec = res["equity_curve"]
             ec_df = pd.DataFrame(ec, columns=["date", "equity"])
             fig = go.Figure()
-            fig.add_trace(go.Scatter(x=ec_df["date"], y=ec_df["equity"], line=dict(color="#26a69a")))
+            fig.add_trace(go.Scatter(x=ec_df["date"], y=ec_df["equity"], line=dict(color="#4FB0A2")))
             fig.update_layout(title="Equity Curve", template="plotly_dark", height=350,
+                               paper_bgcolor="#0A0D12", plot_bgcolor="#10141B",
+                               font=dict(family="IBM Plex Sans, sans-serif", color="#E7E9EE"),
                                margin=dict(t=40, b=10, l=10, r=10))
+            fig.update_xaxes(gridcolor="#1B212B")
+            fig.update_yaxes(gridcolor="#1B212B")
             st.plotly_chart(fig, use_container_width=True)
 
             st.markdown("#### Performance by pattern type")
