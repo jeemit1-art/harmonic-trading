@@ -36,8 +36,9 @@ from patterns import find_patterns
 from confluence import score_confluence
 from telegram_alert import (send_telegram_message, format_pattern_alert, format_action_alert,
                              send_telegram_photo, format_enter_now_caption)
-from backtest import _atr, estimate_time_to_targets, _blended_r
+from backtest import _atr, estimate_time_to_targets
 import trade_manager as tm
+import paper_account as pa
 import leaderboard as lb
 import correlation as corr
 import regime_filter as rf
@@ -54,7 +55,7 @@ CLOSED_ACTIONS = ("EXIT_FULL_T3", "EXIT_STOP", "EXIT_TRAILING_STOP")
 PARTIAL_ACTIONS = ("EXIT_PARTIAL_T1", "EXIT_PARTIAL_T2")
 
 
-def scan_ticker(market: str, ticker: str, state: dict, board: dict) -> int:
+def scan_ticker(market: str, ticker: str, state: dict, board: dict, account: dict) -> int:
     tf = config.SCAN_TIMEFRAMES[market]
     period = config.SCAN_PERIOD[market]
     deviation = config.ZIGZAG_DEVIATION[market]
@@ -166,39 +167,49 @@ def scan_ticker(market: str, ticker: str, state: dict, board: dict) -> int:
                       f"bars_old={bars_old} price_dev={entry_deviation_pct:.2f}%")
                 continue
 
+        # Suppression checks (leaderboard track record, news/earnings
+        # blackout, risk/correlation caps) run BEFORE update_setup, not
+        # after. update_setup is what actually flips a setup to OPEN and
+        # sizes+opens the simulated position -- checking caps afterward
+        # would (a) mean unwinding an already-opened position when
+        # suppressed, and (b) double-count this very trade against
+        # itself in check_risk_caps' concurrent-trade and daily-risk-%
+        # sums, since by then `state` already contains it as OPEN.
+        suppression_note = None
+        if gated_conf.get("entry_ready"):
+            suppress = lb.should_suppress(board, market, ticker, p.name)
+            news = nf.check_news_blackout(ticker, market)
+            risk_check = corr.check_risk_caps(state, market, ticker, p.name, p.direction.value)
+            if suppress["suppress"]:
+                gated_conf["entry_ready"] = False
+                suppression_note = f"weak track record: {suppress['reason']}"
+                print(f"[{datetime.now(timezone.utc).isoformat()}] SUPPRESSED (leaderboard) "
+                      f"{market} {ticker} {p.name}: {suppress['reason']}")
+            elif news["blackout"]:
+                gated_conf["entry_ready"] = False
+                suppression_note = f"news/earnings blackout: {news['earnings']['note']} {news['macro']['note']}"
+                print(f"[{datetime.now(timezone.utc).isoformat()}] SUPPRESSED (news blackout) "
+                      f"{market} {ticker} {p.name}: {news['earnings']['note']} {news['macro']['note']}")
+            elif not risk_check["allowed"]:
+                gated_conf["entry_ready"] = False
+                suppression_note = f"risk/correlation cap: {risk_check['reason']}"
+                print(f"[{datetime.now(timezone.utc).isoformat()}] SUPPRESSED (risk cap) "
+                      f"{market} {ticker} {p.name}: {risk_check['reason']}")
+
         result = tm.update_setup(state, setup_id, market, ticker, tf, p, gated_conf,
-                                  current_price, entry, stop, t1, t2, t3, atr=current_atr,
-                                  bar_high=current_high, bar_low=current_low)
+                                  current_price, entry, stop, t1, t2, t3, account,
+                                  atr=current_atr, bar_high=current_high, bar_low=current_low)
         action = result["action"]
         setup = result["setup"]
 
+        if suppression_note:
+            # entry_ready was forced off above, so update_setup left this
+            # setup in AWAITING_CONFIRMATION (never opened) -- it'll retry
+            # on the next scan if conditions improve. Log why nothing fired.
+            tm._log(setup, "SUPPRESSED", note=f"Entry signal fired but was suppressed ({suppression_note}).")
+            continue
+
         if action == "ENTER_NOW":
-            # leaderboard suppression check
-            suppress = lb.should_suppress(board, market, ticker, p.name)
-            if suppress["suppress"]:
-                print(f"[{datetime.now(timezone.utc).isoformat()}] SUPPRESSED (leaderboard) "
-                      f"{market} {ticker} {p.name}: {suppress['reason']}")
-                # roll the state back to AWAITING so it can re-trigger later if the
-                # track record improves, rather than silently losing the setup
-                setup["status"] = "AWAITING_CONFIRMATION"
-                continue
-
-            # news/earnings blackout check
-            news = nf.check_news_blackout(ticker, market)
-            if news["blackout"]:
-                print(f"[{datetime.now(timezone.utc).isoformat()}] SUPPRESSED (news blackout) "
-                      f"{market} {ticker} {p.name}: {news['earnings']['note']} {news['macro']['note']}")
-                setup["status"] = "AWAITING_CONFIRMATION"
-                continue
-
-            # risk/correlation cap check
-            risk_check = corr.check_risk_caps(state, market, ticker, p.name, p.direction.value)
-            if not risk_check["allowed"]:
-                print(f"[{datetime.now(timezone.utc).isoformat()}] SUPPRESSED (risk cap) "
-                      f"{market} {ticker} {p.name}: {risk_check['reason']}")
-                setup["status"] = "AWAITING_CONFIRMATION"
-                continue
-
             eta = None
             try:
                 eta = estimate_time_to_targets(df, p.name, deviation_pct=deviation,
@@ -231,24 +242,14 @@ def scan_ticker(market: str, ticker: str, state: dict, board: dict) -> int:
                   f"{'sent' if ok else 'queued (no telegram)'}")
 
             if action in CLOSED_ACTIONS:
-                # Record the realized outcome to the leaderboard, using the
-                # SAME blended-R methodology as the backtester (backtest._blended_r)
-                # so live stats are actually comparable to the backtest-seeded
-                # stats they sit alongside in leaderboard.json -- not just a
-                # single price-move proxy that ignores profit already banked
-                # at T1/T2, and not today's close when the actual fill was a
-                # stop or target level recorded in the setup.
-                original_stop = setup.get("original_stop", setup["entry"])
-                initial_risk = abs(setup["entry"] - original_stop)
-                if initial_risk > 0:
-                    exit_price = setup.get("exit_price", current_price)
-                    stop_hit = action in ("EXIT_STOP", "EXIT_TRAILING_STOP")
-                    approx_r = _blended_r(
-                        hit_t1=bool(setup.get("hit_t1")), hit_t2=bool(setup.get("hit_t2")),
-                        stop_hit=stop_hit, risk=initial_risk, entry=setup["entry"],
-                        t1=setup["t1"], t2=setup["t2"], exit_price=exit_price, bullish=bullish,
-                    )
-                    board = lb.record_outcome(board, market, ticker, p.name, approx_r, source="live")
+                # Record the realized outcome to the leaderboard. setup["realized_pnl"]
+                # / setup["risk_amount"] is now the exact blended R across all legs
+                # of the scaled exit (trade_manager settles each leg as it closes),
+                # so this is the true outcome, not a reconstruction of it.
+                risk_amount = setup.get("risk_amount")
+                if risk_amount:
+                    final_r = setup.get("realized_pnl", 0.0) / risk_amount
+                    board = lb.record_outcome(board, market, ticker, p.name, final_r, source="live")
 
         elif action == "SETUP_INVALIDATED":
             print(f"[{datetime.now(timezone.utc).isoformat()}] INVALIDATED {market} {ticker} {p.name}")
@@ -270,12 +271,13 @@ def run_scan(markets: list[str] = None):
     markets = markets or list(WATCHLISTS.keys())
     state = tm.load_state()
     board = lb.load_leaderboard()
+    account = pa.load_account()
     total_new = 0
 
     for market in markets:
         for ticker in WATCHLISTS[market]:
             try:
-                total_new += scan_ticker(market, ticker, state, board)
+                total_new += scan_ticker(market, ticker, state, board, account)
             except Exception as e:
                 print(f"[scanner] ERROR scanning {market}:{ticker} -- {e}", file=sys.stderr)
                 traceback.print_exc()
@@ -283,7 +285,8 @@ def run_scan(markets: list[str] = None):
     state = tm.prune_closed(state)
     tm.save_state(state)
     lb.save_leaderboard(board)
-    print(f"\nScan complete. {total_new} alert(s) sent.")
+    pa.save_account(account)
+    print(f"\nScan complete. {total_new} alert(s) sent. Paper equity: ${pa.get_equity(account):,.2f}")
 
 
 if __name__ == "__main__":

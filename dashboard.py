@@ -22,6 +22,7 @@ from backtest import backtest, _atr
 from confluence import score_confluence, rsi
 import trade_manager as tm
 import leaderboard as lb
+import paper_account as pa
 
 st.set_page_config(page_title="Harmonic \u00b7 Pattern Terminal", layout="wide", page_icon="\U0001F9ED")
 
@@ -369,11 +370,16 @@ with tab0:
         board_rows = lb.leaderboard_summary(board)
         top = next((r for r in board_rows if r["live_avg_r"] is not None), None)
 
-        c1, c2, c3, c4 = st.columns(4)
+        c1, c2, c3, c4, c5 = st.columns(5)
         c1.metric("\U0001F7E2 Open Trades", len(open_items))
         c2.metric("\U0001F440 Watching / Awaiting", len(pending_items))
         c3.metric("\u2705 Closed (tracked)", len(closed_items))
         c4.metric("\U0001F551 Last Scan", last_update[:16].replace("T", " ") if last_update else "No scans yet")
+        account = pa.load_account()
+        equity = pa.get_equity(account)
+        starting = account.get("starting_equity", config.PAPER_STARTING_EQUITY)
+        c5.metric("\U0001F4B0 Paper Equity", f"${equity:,.0f}",
+                  f"{((equity/starting)-1)*100:+.2f}%" if starting else None)
 
         if top:
             st.caption(f"\U0001F3C6 Best-performing combo so far: **{top['ticker']} {top['pattern']}** "
@@ -393,9 +399,13 @@ with tab0:
             for k, v in open_items.items():
                 direction_word = "LONG" if v["direction"] == "bullish" else "SHORT"
                 label = f"{v['ticker']} -- {v['pattern']} ({direction_word})"
+                realized = v.get("realized_pnl", 0.0)
+                risk_amt = v.get("risk_amount")
                 rows.append({"Setup": label, "Status": v["status"], "Entry": round(v["entry"], 4),
                              "Stop": round(v["stop"], 4), "T1": round(v["t1"], 4), "T2": round(v["t2"], 4),
-                             "T3": round(v["t3"], 4), "Fraction Left": f"{v.get('fraction_remaining', 1.0):.0%}"})
+                             "T3": round(v["t3"], 4), "Fraction Left": f"{v.get('fraction_remaining', 1.0):.0%}",
+                             "Realized P&L": f"${realized:+,.2f}",
+                             "R (realized so far)": f"{realized/risk_amt:+.2f}R" if risk_amt else "--"})
                 key_lookup[label] = k
             open_df = pd.DataFrame(rows)
             event = st.dataframe(open_df, use_container_width=True, hide_index=True,
@@ -615,16 +625,55 @@ with tab4:
     st.subheader("Setups tracked by the scanner")
     st.caption("This reflects whatever the scanner (scanner.py, run via GitHub Actions) has found on its "
                "last run. Run the scanner at least once for this to show anything.")
+    st.caption("\u26A0\uFE0F **Paper trading, not live execution.** There is no broker/exchange connection "
+               "anywhere in this project. Every ENTER NOW alert opens a *simulated* position, sized off "
+               "the paper account below using RISK_PER_TRADE_PCT, and settles real P&L against it -- "
+               "no order is ever placed anywhere.")
+
+    account = pa.load_account()
     state = tm.load_state()
+
+    # --- paper account summary ------------------------------------------------
+    equity = pa.get_equity(account)
+    starting = account.get("starting_equity", config.PAPER_STARTING_EQUITY)
+    total_return_pct = ((equity / starting) - 1) * 100 if starting else 0.0
+    a1, a2, a3, a4 = st.columns(4)
+    a1.metric("Paper equity", f"${equity:,.2f}", f"{total_return_pct:+.2f}%")
+    a2.metric("Realized P&L (all-time)", f"${account.get('realized_pnl_total', 0.0):+,.2f}")
+    a3.metric("Starting balance", f"${starting:,.2f}")
+    a4.metric("Settled legs", account.get("n_closed_legs", 0))
+
+    curve = account.get("equity_curve", [])
+    if len(curve) > 1:
+        ec_fig = go.Figure()
+        ec_fig.add_trace(go.Scatter(
+            x=[pt["date"] for pt in curve], y=[pt["equity"] for pt in curve],
+            line=dict(color="#4FB0A2"), fill="tozeroy", fillcolor="rgba(79,176,162,0.08)"))
+        ec_fig.update_layout(title="Paper account equity", template="plotly_dark", height=260,
+                              paper_bgcolor="#0A0D12", plot_bgcolor="#10141B",
+                              font=dict(family="IBM Plex Sans, sans-serif", color="#E7E9EE"),
+                              margin=dict(t=40, b=10, l=10, r=10), showlegend=False)
+        ec_fig.update_xaxes(gridcolor="#1B212B")
+        ec_fig.update_yaxes(gridcolor="#1B212B")
+        st.plotly_chart(ec_fig, use_container_width=True)
+
+    st.divider()
+
     if not state:
         st.info("No tracked setups yet. Run the scanner at least once, or wait for the next scheduled scan.")
     else:
         status_order = {"OPEN": 0, "PARTIAL_T1": 1, "PARTIAL_T2": 2, "AWAITING_CONFIRMATION": 3,
-                         "WATCHING": 4, "CLOSED_T3": 5, "CLOSED_STOP": 6, "CLOSED_INVALIDATED": 7}
+                         "WATCHING": 4, "CLOSED_T3": 5, "CLOSED_STOP": 6, "CLOSED_TRAILING": 6,
+                         "CLOSED_INVALIDATED": 7}
         status_labels = {"OPEN": "\U0001F7E2 Open", "PARTIAL_T1": "\U0001F7E1 Partial (T1 hit)",
                           "PARTIAL_T2": "\U0001F7E1 Partial (T2 hit)", "AWAITING_CONFIRMATION": "\u23F3 Awaiting confirmation",
                           "WATCHING": "\U0001F440 Watching", "CLOSED_T3": "\u2705 Closed (T3)",
-                          "CLOSED_STOP": "\U0001F534 Closed (stop)", "CLOSED_INVALIDATED": "\u26AA Invalidated"}
+                          "CLOSED_STOP": "\U0001F534 Closed (stop)", "CLOSED_TRAILING": "\U0001F535 Closed (trailing stop)",
+                          "CLOSED_INVALIDATED": "\u26AA Invalidated"}
+        event_labels = {"WATCHING": "\U0001F440", "AWAITING_CONFIRMATION": "\u23F3", "SUPPRESSED": "\U0001F6AB",
+                         "OPEN": "\U0001F7E2", "EXIT_PARTIAL_T1": "\U0001F7E1", "EXIT_PARTIAL_T2": "\U0001F7E1",
+                         "EXIT_FULL_T3": "\u2705", "EXIT_STOP": "\U0001F534", "EXIT_TRAILING_STOP": "\U0001F535",
+                         "INVALIDATED": "\u26AA"}
 
         sorted_items = sorted(state.items(), key=lambda kv: status_order.get(kv[1]["status"], 9))
         active_items = [(k, v) for k, v in sorted_items if v["status"] in ("OPEN", "PARTIAL_T1", "PARTIAL_T2")]
@@ -638,30 +687,73 @@ with tab4:
 
         def render_setup_card(setup_id, s):
             direction_word = "LONG" if s["direction"] == "bullish" else "SHORT"
+            is_live = s["status"] in ("OPEN", "PARTIAL_T1", "PARTIAL_T2")
+            has_position = "units" in s
+
+            # fetch live data once -- used for both mark-to-market P&L and the chart
+            live_df, live_atr, current_price = None, None, None
+            try:
+                live_df = DEFAULT_SOURCE.fetch(s["ticker"], interval=s["timeframe"],
+                                                period=config.SCAN_PERIOD.get(s["market"], "1y"))
+                live_atr = _atr(live_df)
+                current_price = float(live_df["Close"].iloc[-1])
+            except Exception:
+                pass
+
+            pnl_suffix = ""
+            if has_position:
+                mtm = tm.mark_to_market(s, current_price if current_price is not None else s["entry"])
+                pnl_suffix = f" -- {'$' if mtm['total_pnl'] >= 0 else '-$'}{abs(mtm['total_pnl']):.2f}"
+
             with st.expander(f"{status_labels.get(s['status'], s['status'])} -- {s['ticker']} -- "
-                              f"{s['pattern']} ({direction_word}) -- {s['market']}/{s['timeframe']}",
-                              expanded=(s["status"] in ("OPEN", "PARTIAL_T1", "PARTIAL_T2"))):
+                              f"{s['pattern']} ({direction_word}) -- {s['market']}/{s['timeframe']}{pnl_suffix}",
+                              expanded=is_live):
                 c1, c2, c3, c4 = st.columns(4)
                 c1.metric("Entry", f"{s['entry']:.4f}")
                 c2.metric("Stop", f"{s['stop']:.4f}")
                 c3.metric("T1 / T2 / T3", f"{s['t1']:.4f} / {s['t2']:.4f} / {s['t3']:.4f}")
                 c4.metric("Fraction left", f"{s.get('fraction_remaining', 1.0):.0%}")
+
+                if has_position:
+                    mtm = tm.mark_to_market(s, current_price if current_price is not None else s["entry"])
+                    p1, p2, p3, p4 = st.columns(4)
+                    p1.metric("Position size", f"{s['units']:.4f} units")
+                    p2.metric("Realized P&L", f"${mtm['realized_pnl']:+,.2f}")
+                    if is_live:
+                        p3.metric("Unrealized P&L (mark-to-market)", f"${mtm['unrealized_pnl']:+,.2f}")
+                    else:
+                        p3.metric("Final P&L", f"${mtm['total_pnl']:+,.2f}")
+                    p4.metric("R-multiple", f"{mtm['r_multiple']:+.2f}R" if mtm["r_multiple"] is not None else "--")
+                    st.caption(f"Risked ${s.get('risk_amount', 0):.2f} "
+                               f"({config.RISK_PER_TRADE_PCT}% of ${s.get('equity_at_entry', 0):,.2f} "
+                               f"paper equity at entry).")
+
                 st.caption(f"Last update: {s.get('last_update', '?')}")
+
+                # --- what happened: the event timeline ------------------------
+                events = s.get("events", [])
+                if events:
+                    with st.expander("What happened on this setup", expanded=False):
+                        for e in reversed(events):
+                            icon = event_labels.get(e["event"], "\u2022")
+                            ts = e.get("ts", "")[:16].replace("T", " ")
+                            pnl_txt = f" (**${e['pnl']:+,.2f}**)" if e.get("pnl") is not None else ""
+                            st.markdown(f"{icon} `{ts}` **{e['event']}**{pnl_txt} -- {e.get('note', '')}")
 
                 pattern_obj = tm.reconstruct_pattern(s)
                 if pattern_obj is None:
                     st.info("This setup was tracked before chart data was stored -- no chart available "
                             "for it (will appear for setups tracked from now on).")
                     return
-                try:
-                    live_df = DEFAULT_SOURCE.fetch(s["ticker"], interval=s["timeframe"],
-                                                    period=config.SCAN_PERIOD.get(s["market"], "1y"))
-                    live_atr = _atr(live_df)
-                    fig = plot_chart(live_df, [pattern_obj], title=f"{s['ticker']} -- {s['timeframe']}",
-                                      atr_series=live_atr)
-                    st.plotly_chart(fig, use_container_width=True, key=f"chart_{setup_id}")
-                except Exception as e:
-                    st.warning(f"Could not load live chart for {s['ticker']}: {e}")
+                if live_df is not None:
+                    try:
+                        fig = plot_chart(live_df, [pattern_obj], title=f"{s['ticker']} -- {s['timeframe']}",
+                                          atr_series=live_atr)
+                        st.plotly_chart(fig, use_container_width=True, key=f"chart_{setup_id}")
+                    except Exception as e:
+                        st.warning(f"Could not render chart for {s['ticker']}: {e}")
+                else:
+                    st.warning(f"Could not load live chart data for {s['ticker']}.")
 
         if active_items:
             st.markdown("### Currently open")
@@ -675,6 +767,10 @@ with tab4:
 
         if closed_items:
             st.markdown("### Closed history")
+            total_closed_pnl = sum(v.get("realized_pnl", 0.0) for _, v in closed_items)
+            wins = sum(1 for _, v in closed_items if v.get("realized_pnl", 0.0) > 0)
+            st.caption(f"{wins}/{len(closed_items)} closed setups profitable -- "
+                       f"${total_closed_pnl:+,.2f} total realized P&L across all closed history shown below.")
             for setup_id, s in closed_items[:15]:
                 render_setup_card(setup_id, s)
             if len(closed_items) > 15:

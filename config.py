@@ -89,6 +89,16 @@ MAX_DAILY_RISK_PCT = 3.0        # stop taking new trades once this much is at ri
 USE_TRAILING_STOP_AFTER_T2 = True
 TRAILING_ATR_MULT = 1.5
 
+# --- Paper trading account ---------------------------------------------------
+# There is no broker/exchange integration in this project -- ENTER_NOW never
+# places a real order anywhere. What it DOES do is open a simulated position
+# in paper_account.json, sized off this starting balance using
+# RISK_PER_TRADE_PCT, and track it through to a real settled P&L using the
+# exact same entry/stop/target levels the Telegram alert sent. This is what
+# the dashboard's Open Trades / Live Overview tabs display. Reset by deleting
+# paper_account.json (a fresh one is created at this starting balance).
+PAPER_STARTING_EQUITY = 10000.0
+
 # --- News/earnings blackout -------------------------------------------------
 # Manually maintained high-impact macro events (no reliable free real-time
 # calendar API exists -- see news_filter.py for why). Populate with events

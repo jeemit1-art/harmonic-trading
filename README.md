@@ -105,6 +105,22 @@ restarts), so you get exactly one ENTER NOW alert per setup and one EXIT
 alert per target/stop -- no duplicate spam. The dashboard's **Open Trades**
 tab shows the same state visually.
 
+### Paper trading account
+
+There is no broker/exchange integration in this project -- an ENTER NOW
+alert never places a real order anywhere. What it *does* do is open a
+**simulated position** in `paper_account.json`, sized off that account's
+equity using `config.RISK_PER_TRADE_PCT`, and settle real P&L against it
+as each leg of the scaled exit (T1/T2/T3 or stop) closes, using the exact
+levels the alert sent. This is what backs the **Open Trades** tab's P&L
+figures and the **Live Overview** tab's paper-equity metric, and every
+tracked setup keeps a plain-English event log ("what happened") -- when it
+opened, each partial exit and why, and how it finally closed.
+
+Starting balance is `config.PAPER_STARTING_EQUITY` (default $10,000).
+Reset the account by deleting `paper_account.json` -- a fresh one is
+created automatically at that starting balance on the next scan.
+
 
 
 ## Deployment: GitHub Actions + Render (no VM needed)
@@ -117,8 +133,9 @@ GitHub is now central to running this, not optional -- see
   networking configuration. Your Telegram token/chat ID are stored as
   **GitHub Actions secrets** (Settings -> Secrets and variables -> Actions),
   read via environment variables in `config.py` -- never committed as
-  plaintext. The workflow commits `trade_state.json` and `leaderboard.json`
-  back to the repo after each run so state persists between scans.
+  plaintext. The workflow commits `trade_state.json`, `leaderboard.json`,
+  and `paper_account.json` back to the repo after each run so state (and
+  the paper trading account's equity) persists between scans.
 - **Dashboard** (optional): deploy to **Render** by connecting your GitHub
   repo through their website -- they build and host it automatically,
   free tier available.
@@ -204,11 +221,13 @@ tested.
 - **yfinance is unofficial and free** -- it can rate-limit, lag, or break.
   Fine for swing-timeframe harmonic trading (1h+), not suitable for
   scalping or anything latency-sensitive.
-- **No execution is wired up.** This detects and alerts; it does not place
-  orders. That's deliberate -- adding broker execution is a much bigger
-  step you should only take after you trust the signal quality, and it
-  would need explicit broker API integration (Zerodha Kite / IBKR / OANDA)
-  which isn't in this build.
+- **No live execution is wired up.** ENTER NOW alerts open a *simulated*
+  paper-trading position (see "Paper trading account" above) that tracks
+  real P&L against the exact levels alerted -- but no real order is ever
+  placed anywhere. That's deliberate -- adding real broker execution is a
+  much bigger step you should only take after you trust the signal
+  quality, and it would need explicit broker API integration (Zerodha
+  Kite / IBKR / OANDA) which isn't in this build.
 - **No strategy guarantees profit.** Harmonic patterns are a structured way
   to define risk and find statistically-favoured reversal zones, not a
   crystal ball. Every number this system gives you (win rate, R-multiple,

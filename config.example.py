@@ -57,6 +57,12 @@ MAX_DAILY_RISK_PCT = 3.0        # stop taking new trades once this much is at ri
 USE_TRAILING_STOP_AFTER_T2 = True
 TRAILING_ATR_MULT = 1.5
 
+# --- Paper trading account ---------------------------------------------------
+# No broker/exchange integration exists in this project -- ENTER_NOW opens a
+# simulated position (sized off this balance via RISK_PER_TRADE_PCT) tracked
+# in paper_account.json, not a real order. See config.py for details.
+PAPER_STARTING_EQUITY = 10000.0
+
 # --- News/earnings blackout -------------------------------------------------
 # Manually maintained high-impact macro events (no reliable free real-time
 # calendar API exists -- see news_filter.py for why). Populate with events
