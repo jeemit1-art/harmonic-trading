@@ -252,17 +252,11 @@ def _ratio(p1: Pivot, p2: Pivot, p3: Pivot, p4: Pivot) -> float:
     return leg2 / leg1
 
 
-def _quality_score(rule: PatternRule, ab_xa, bc_ab, cd_leg=None) -> float:
+def _quality_score(rule: PatternRule, ab_xa, bc_ab, cd_leg) -> float:
     """
     Score how close the actual ratios are to the IDEAL (midpoint) Fibonacci
     numbers for this pattern, not just "inside the tolerance band".
     Tighter confluence at D = historically higher win rate.
-
-    cd_leg is optional: for a still-forming pattern (no D pivot yet) there
-    is no real CD ratio to score, so the score is based on AB/XA and BC/AB
-    only. Passing a fabricated cd_leg here would score it against the
-    CD/BC or CD/XC range and produce a misleadingly low number -- always
-    omit cd_leg rather than substitute another ratio for it.
     """
     def closeness(val, rng: RatioRange) -> float:
         mid = (rng.lo + rng.hi) / 2
@@ -270,11 +264,10 @@ def _quality_score(rule: PatternRule, ab_xa, bc_ab, cd_leg=None) -> float:
         return max(0.0, 1 - abs(val - mid) / (span * 2))
 
     scores = [closeness(ab_xa, rule.ab_xa), closeness(bc_ab, rule.bc_ab)]
-    if cd_leg is not None:
-        if rule.measured_from_xc:
-            scores.append(closeness(cd_leg, rule.cd_xc))
-        else:
-            scores.append(closeness(cd_leg, rule.cd_bc))
+    if rule.measured_from_xc:
+        scores.append(closeness(cd_leg, rule.cd_xc))
+    else:
+        scores.append(closeness(cd_leg, rule.cd_bc))
     return round(float(np.mean(scores)) * 100, 1)
 
 
@@ -313,30 +306,41 @@ def find_patterns(df: pd.DataFrame, deviation_pct: float = 3.0,
                 continue
             if not rule.bc_ab.contains(bc_ab, tolerance):
                 continue
-            cd_leg = cd_xc if rule.measured_from_xc else cd_bc
-            cd_rule = rule.cd_xc if rule.measured_from_xc else rule.cd_bc
-            if not cd_rule.contains(cd_leg, tolerance):
-                continue
-            # CRITICAL: the AD/XA ratio is what actually distinguishes these
-            # patterns from each other (Gartley's defining 0.786 vs Bat's
-            # 0.886 vs Crab's 1.618, etc) -- without checking it, wildly
-            # different D completions all get accepted as long as the
-            # earlier legs happen to match, which is how the same price
-            # structure was previously getting classified as multiple
-            # different, contradictory patterns at once.
-            #
-            # Cypher's ad_xa is a genuine placeholder (0.0-0.0, unused --
-            # its D is fully defined by cd_xc alone) so it's correctly
-            # skipped. Shark is DIFFERENT: its own rule explicitly defines
-            # a real ad_xa range (0.886-1.13) and its notes say to check
-            # D against BOTH cd_xc and ad_xa as confluence -- skipping it
-            # for Shark (as an earlier version of this code mistakenly did,
-            # grouping it with Cypher just because both use
-            # measured_from_xc) meant Shark matches were only being
-            # validated against half their defining criteria.
-            ad_xa_is_meaningful = not (rule.ad_xa.lo == 0.0 and rule.ad_xa.hi == 0.0)
-            if ad_xa_is_meaningful and not rule.ad_xa.contains(ad_xa, tolerance):
-                continue
+
+            cd_leg = cd_xc if rule.measured_from_xc else cd_bc  # used for scoring/display below
+
+            if rule.measured_from_xc:
+                # Cypher: D is fully defined by cd_xc alone (its ad_xa is a
+                # genuine unused placeholder, 0.0-0.0 -- correctly skipped).
+                # Shark is DIFFERENT: its own rule defines a real ad_xa
+                # range (0.886-1.13), and both Carney's own documentation
+                # and widely-used reference implementations require D to
+                # be confirmed against BOTH cd_xc and ad_xa together (AND),
+                # not either/or -- so Shark keeps the stricter check.
+                if not rule.cd_xc.contains(cd_xc, tolerance):
+                    continue
+                ad_xa_is_meaningful = not (rule.ad_xa.lo == 0.0 and rule.ad_xa.hi == 0.0)
+                if ad_xa_is_meaningful and not rule.ad_xa.contains(ad_xa, tolerance):
+                    continue
+            else:
+                # Gartley / Bat / Alt Bat / Butterfly / Crab / Deep Crab:
+                # D can be confirmed by EITHER the CD/BC extension ratio OR
+                # the AD/XA retracement ratio -- this is the standard
+                # harmonic-trading convention (confirmed against a
+                # widely-used reference implementation), since these two
+                # Fibonacci projections are alternative confirmations of
+                # the same PRZ, not both mandatory. Requiring both (AND)
+                # is stricter than the accepted definition and rejects
+                # valid patterns where only one projection converges
+                # tightly -- but checking NEITHER (the original bug) let
+                # wildly different D completions all pass as long as the
+                # earlier legs happened to match, which is how the same
+                # structure was getting classified as multiple different,
+                # contradictory patterns at once.
+                cd_bc_ok = rule.cd_bc.contains(cd_bc, tolerance)
+                ad_xa_ok = rule.ad_xa.contains(ad_xa, tolerance)
+                if not (cd_bc_ok or ad_xa_ok):
+                    continue
 
             # PRZ: project D from both the XA ratio and the CD/XC ratio for confluence
             xa_len = A.price - X.price
@@ -361,6 +365,7 @@ def find_patterns(df: pd.DataFrame, deviation_pct: float = 3.0,
 
             q = _quality_score(rule, ab_xa, bc_ab, cd_leg)
 
+            is_last_leg = (D.index >= last_idx - 3)  # D pivot is recent -> confirmed recently
             confirmed = True
 
             pat = HarmonicPattern(
@@ -403,7 +408,7 @@ def find_patterns(df: pd.DataFrame, deviation_pct: float = 3.0,
                         prz_lo=prz_lo, prz_hi=prz_hi,
                         ratios={"AB/XA": round(ab_xa, 3), "BC/AB": round(bc_ab, 3)},
                         confirmed=False,
-                        quality_score=_quality_score(rule, ab_xa, bc_ab),
+                        quality_score=_quality_score(rule, ab_xa, bc_ab, bc_ab),
                     )
                     results.append(pat)
 

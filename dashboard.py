@@ -22,136 +22,56 @@ from backtest import backtest, _atr
 from confluence import score_confluence, rsi
 import trade_manager as tm
 import leaderboard as lb
-import paper_account as pa
 
-st.set_page_config(page_title="Harmonic \u00b7 Pattern Terminal", layout="wide", page_icon="\U0001F9ED")
+st.set_page_config(page_title="Harmonic Trading Dashboard", layout="wide", page_icon="\U0001F4C8")
 
-# ---------------------------------------------------------------------------
-# Design tokens
-# ---------------------------------------------------------------------------
-# The subject here is literally a drafting instrument: ratio-measured
-# geometry (X-A-B-C-D) laid over price. Palette and type lean into that --
-# an ink-dark ground, a brass "instrument" accent for structure/actions, and
-# desaturated teal/coral/steel for bullish/bearish/watching states (not the
-# generic single neon-on-black look). Space Grotesk carries the geometric
-# display role, Plex Sans is body text, Plex Mono is reserved for anything
-# that is a number a trader has to read precisely.
-BRAND_CSS = """
+st.markdown("""
 <style>
-@import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500;600&display=swap');
+    html, body, [class*="css"] { font-family: -apple-system, 'Segoe UI', Inter, sans-serif; }
+    .stApp { background: #0B0E13; }
 
-:root {
-    --bg: #0A0D12;
-    --panel: #10141B;
-    --panel-2: #151B24;
-    --border: #232A38;
-    --text: #E7E9EE;
-    --muted: #8890A2;
-    --brass: #C9A45C;
-    --brass-dim: #8C6F3E;
-    --teal: #4FB0A2;
-    --coral: #E2685F;
-    --steel: #6C9BD1;
-}
+    /* headers */
+    h1, h2, h3 { font-weight: 800 !important; letter-spacing: -0.01em; }
+    h1 { background: linear-gradient(90deg, #F5A623, #9C8CFF);
+         -webkit-background-clip: text; -webkit-text-fill-color: transparent;
+         display: inline-block; }
 
-html, body, [class*="css"] { font-family: 'IBM Plex Sans', -apple-system, 'Segoe UI', sans-serif; }
-.stApp { background: var(--bg); }
-.block-container { padding-top: 1.4rem; max-width: 1400px; }
+    /* tabs */
+    .stTabs [data-baseweb="tab-list"] { gap: 6px; }
+    .stTabs [data-baseweb="tab"] {
+        background: #12161F; border-radius: 8px 8px 0 0; padding: 10px 18px;
+        color: #7C8598; font-weight: 600; border: 1px solid #232938; border-bottom: none;
+    }
+    .stTabs [aria-selected="true"] { background: #171C27 !important; color: #E7EAF1 !important; }
 
-/* ---- typography ------------------------------------------------------ */
-h1, h2, h3, h4 { font-family: 'Space Grotesk', sans-serif; font-weight: 600 !important;
-                 letter-spacing: -0.01em; color: var(--text); }
-h3 { color: var(--text) !important; margin-top: 0.2em; }
-p, li, span, label { color: var(--text); }
-.stCaption, [data-testid="stCaptionContainer"] { color: var(--muted) !important; }
-code { color: var(--brass); background: var(--panel-2) !important; }
+    /* metrics */
+    [data-testid="stMetric"] {
+        background: #12161F; border: 1px solid #232938; border-radius: 10px;
+        padding: 12px 16px;
+    }
+    [data-testid="stMetricValue"] { font-family: 'SFMono-Regular', Consolas, monospace; font-weight: 700; }
 
-/* ---- masthead ---------------------------------------------------------- */
-.hpt-masthead { display: flex; align-items: center; gap: 14px; padding-bottom: 4px; }
-.hpt-wordmark { font-family: 'Space Grotesk', sans-serif; font-weight: 700; font-size: 1.7rem;
-                color: var(--text); letter-spacing: -0.01em; }
-.hpt-wordmark span { color: var(--brass); }
-.hpt-tagline { color: var(--muted); font-size: 0.86rem; margin-top: -2px; }
+    /* buttons */
+    .stButton>button {
+        background: linear-gradient(135deg, #F5A623, #c47f13); color: #1a1200;
+        font-weight: 700; border: none; border-radius: 8px;
+    }
+    .stButton>button:hover { background: linear-gradient(135deg, #ffb84d, #e0941a); color: #1a1200; }
 
-/* ---- tabs: underline instrument-rail nav, not boxy browser tabs ------ */
-.stTabs [data-baseweb="tab-list"] {
-    gap: 26px; border-bottom: 1px solid var(--border); margin-bottom: 6px;
-}
-.stTabs [data-baseweb="tab"] {
-    background: transparent; padding: 8px 2px 12px 2px; color: var(--muted);
-    font-family: 'Space Grotesk', sans-serif; font-weight: 600; font-size: 0.92rem;
-    border: none; border-bottom: 2px solid transparent;
-}
-.stTabs [data-baseweb="tab"]:hover { color: var(--text); }
-.stTabs [aria-selected="true"] {
-    background: transparent !important; color: var(--brass) !important;
-    border-bottom: 2px solid var(--brass) !important;
-}
-.stTabs [data-baseweb="tab-highlight"] { background: transparent; }
-.stTabs [data-baseweb="tab-panel"] { padding-top: 18px; }
+    /* expanders (setup cards) */
+    .streamlit-expanderHeader {
+        background: #12161F; border-radius: 8px; font-weight: 600;
+    }
 
-/* ---- metrics: instrument-dial cards ----------------------------------- */
-[data-testid="stMetric"] {
-    background: var(--panel); border: 1px solid var(--border); border-radius: 6px;
-    padding: 12px 16px; border-top: 2px solid var(--brass-dim);
-}
-[data-testid="stMetricLabel"] { color: var(--muted) !important; font-size: 0.72rem !important;
-    text-transform: uppercase; letter-spacing: 0.06em; font-weight: 600 !important; }
-[data-testid="stMetricValue"] { font-family: 'IBM Plex Mono', 'SFMono-Regular', monospace !important;
-    font-weight: 600 !important; color: var(--text) !important; }
+    /* dataframes */
+    [data-testid="stDataFrame"] { border-radius: 8px; overflow: hidden; }
 
-/* ---- buttons ----------------------------------------------------------- */
-.stButton>button {
-    background: var(--brass); color: #17130A; font-family: 'Space Grotesk', sans-serif;
-    font-weight: 600; border: none; border-radius: 5px; letter-spacing: 0.01em;
-}
-.stButton>button:hover { background: #DBB56E; color: #17130A; }
-.stButton>button[kind="secondary"] { background: var(--panel-2); color: var(--text);
-    border: 1px solid var(--border); }
-
-/* ---- expanders (setup / trade-plan cards) ------------------------------ */
-.streamlit-expanderHeader, [data-testid="stExpander"] summary {
-    background: var(--panel) !important; border: 1px solid var(--border) !important;
-    border-radius: 6px; font-family: 'Space Grotesk', sans-serif; font-weight: 600 !important;
-}
-[data-testid="stExpander"] { border: none !important; }
-[data-testid="stExpanderDetails"] { background: var(--panel); border: 1px solid var(--border);
-    border-top: none; border-radius: 0 0 6px 6px; padding: 4px 6px; }
-
-/* ---- dataframes / tables ------------------------------------------------ */
-[data-testid="stDataFrame"] { border-radius: 6px; overflow: hidden; border: 1px solid var(--border); }
-
-/* ---- inputs -------------------------------------------------------------- */
-.stTextInput input, .stNumberInput input, .stSelectbox div[data-baseweb="select"] > div {
-    background: var(--panel) !important; border-color: var(--border) !important;
-    color: var(--text) !important; border-radius: 5px !important;
-}
-.stSlider [data-baseweb="slider"] div[role="slider"] { background: var(--brass) !important; }
-.stCheckbox label { color: var(--text) !important; }
-
-/* ---- alerts / info boxes -------------------------------------------------- */
-[data-testid="stAlertContentInfo"] { color: var(--text); }
-div[data-baseweb="notification"] { border-radius: 6px; }
-
-/* ---- dividers -------------------------------------------------------------- */
-hr { border-color: var(--border) !important; }
+    /* number/text inputs, selects */
+    .stTextInput input, .stNumberInput input, .stSelectbox div[data-baseweb="select"] {
+        background: #12161F !important; border-color: #232938 !important;
+    }
 </style>
-"""
-st.markdown(BRAND_CSS, unsafe_allow_html=True)
-
-# small hand-drawn X-A-B-C-D zigzag -- the app's one signature mark, echoed
-# nowhere else so it stays a mark rather than a decoration
-ZIGZAG_MARK = """
-<svg width="34" height="28" viewBox="0 0 34 28" fill="none" xmlns="http://www.w3.org/2000/svg">
-  <polyline points="2,22 9,6 16,18 24,4 32,20" stroke="#C9A45C" stroke-width="2.2"
-            stroke-linecap="round" stroke-linejoin="round" fill="none"/>
-  <circle cx="2" cy="22" r="2" fill="#6C9BD1"/>
-  <circle cx="9" cy="6" r="2" fill="#E2685F"/>
-  <circle cx="16" cy="18" r="2" fill="#6C9BD1"/>
-  <circle cx="24" cy="4" r="2" fill="#E2685F"/>
-  <circle cx="32" cy="20" r="2.4" fill="#C9A45C"/>
-</svg>
-"""
+""", unsafe_allow_html=True)
 
 MARKET_TICKERS = WATCHLISTS
 TIMEFRAME_OPTIONS = ["15m", "30m", "1h", "4h", "1d"]
@@ -164,13 +84,13 @@ def plot_chart(df: pd.DataFrame, patterns: list, title: str = "", atr_series: pd
 
     fig.add_trace(go.Candlestick(
         x=df.index, open=df['Open'], high=df['High'], low=df['Low'], close=df['Close'],
-        name="Price", increasing_line_color="#4FB0A2", decreasing_line_color="#E2685F",
+        name="Price", increasing_line_color="#26a69a", decreasing_line_color="#ef5350",
         hovertext=[f"Open: {o:.4f}<br>High: {h:.4f}<br>Low: {l:.4f}<br>Close: {c:.4f}"
                    for o, h, l, c in zip(df['Open'], df['High'], df['Low'], df['Close'])],
         hoverinfo="x+text"
     ), row=1, col=1)
 
-    colors = ["#C9A45C", "#6C9BD1", "#4FB0A2", "#E2685F", "#8F7CE8", "#D68FC9", "#7FC97F"]
+    colors = ["#f5a623", "#7b61ff", "#00c2a8", "#ff6b6b", "#4dabf7", "#c084fc", "#20c997"]
 
     def _mid(p1, p2):
         return p1.timestamp + (p2.timestamp - p1.timestamp) / 2, (p1.price + p2.price) / 2
@@ -245,31 +165,29 @@ def plot_chart(df: pd.DataFrame, patterns: list, title: str = "", atr_series: pd
             t2 = entry + 0.618 * cd_leg if bullish else entry - 0.618 * cd_leg
             t3 = p.A.price
 
-            fig.add_hline(y=stop, line=dict(color="#E2685F", width=1.3), row=1, col=1,
+            fig.add_hline(y=stop, line=dict(color="#ff5c6c", width=1.3), row=1, col=1,
                           annotation_text=f"Stop: {stop:.4f}", annotation_position="left",
-                          annotation_font=dict(color="#E2685F", size=11))
+                          annotation_font=dict(color="#ff5c6c", size=11))
             fig.add_hline(y=entry, line=dict(color=color, width=1.3, dash="dot"), row=1, col=1,
                           annotation_text=f"Entry: {entry:.4f}", annotation_position="left",
                           annotation_font=dict(color=color, size=11))
             for label, val in [("Target 1", t1), ("Target 2", t2), ("Target 3", t3)]:
-                fig.add_hline(y=val, line=dict(color="#4FB0A2", width=1.1), row=1, col=1,
+                fig.add_hline(y=val, line=dict(color="#26d98c", width=1.1), row=1, col=1,
                               annotation_text=f"{label}: {val:.4f}", annotation_position="left",
-                              annotation_font=dict(color="#4FB0A2", size=10.5))
+                              annotation_font=dict(color="#26d98c", size=10.5))
 
             # pattern name tag near D
             fig.add_annotation(x=p.D.timestamp, y=stop if bullish else t3, text=f" {p.name} ",
-                                showarrow=False, font=dict(size=11, color="#9FC1E8"),
-                                bgcolor="rgba(21,27,36,0.92)", bordercolor="#6C9BD1",
+                                showarrow=False, font=dict(size=11, color="#8fc7ff"),
+                                bgcolor="rgba(18,40,63,0.9)", bordercolor="#4dabf7",
                                 borderwidth=1, row=1, col=1, yshift=-14 if bullish else 14)
 
     r = rsi(df['Close'])
-    fig.add_trace(go.Scatter(x=df.index, y=r, name="RSI", line=dict(color="#8F7CE8")), row=2, col=1)
-    fig.add_hline(y=70, line_dash="dot", line_color="#4A5262", row=2, col=1)
-    fig.add_hline(y=30, line_dash="dot", line_color="#4A5262", row=2, col=1)
+    fig.add_trace(go.Scatter(x=df.index, y=r, name="RSI", line=dict(color="#a78bfa")), row=2, col=1)
+    fig.add_hline(y=70, line_dash="dot", line_color="grey", row=2, col=1)
+    fig.add_hline(y=30, line_dash="dot", line_color="grey", row=2, col=1)
 
     fig.update_layout(height=750, template="plotly_dark", margin=dict(t=70, b=10, l=10, r=10),
-                       paper_bgcolor="#0A0D12", plot_bgcolor="#10141B",
-                       font=dict(family="IBM Plex Sans, sans-serif", color="#E7E9EE"),
                        legend=dict(orientation="h", y=1.03),
                        dragmode="pan",  # click-drag pans by default; scroll/pinch to zoom
                        hovermode="x unified")
@@ -283,14 +201,13 @@ def plot_chart(df: pd.DataFrame, patterns: list, title: str = "", atr_series: pd
                 dict(count=1, label="1Y", step="year", stepmode="backward"),
                 dict(step="all", label="All"),
             ],
-            bgcolor="#151B24", activecolor="#C9A45C", font=dict(color="#E7E9EE", size=11),
+            bgcolor="#171C27", activecolor="#F5A623", font=dict(color="#E7EAF1", size=11),
             y=1.18, yanchor="top",
         ),
         row=1, col=1,
     )
-    fig.update_xaxes(rangeslider=dict(visible=False), row=1, col=1, gridcolor="#1B212B")
-    fig.update_xaxes(rangeslider=dict(visible=True, thickness=0.06, bgcolor="#10141B"), row=2, col=1, gridcolor="#1B212B")
-    fig.update_yaxes(gridcolor="#1B212B")
+    fig.update_xaxes(rangeslider=dict(visible=False), row=1, col=1)
+    fig.update_xaxes(rangeslider=dict(visible=True, thickness=0.06, bgcolor="#12161F"), row=2, col=1)
     return fig
 
 
@@ -337,20 +254,12 @@ def trade_plan_box(df, p, atr_series):
 
 
 # ---------------------------------------------------------------------------
-st.markdown(f"""
-<div class="hpt-masthead">
-    {ZIGZAG_MARK}
-    <div>
-        <div class="hpt-wordmark">Harmonic<span>.</span>Terminal</div>
-        <div class="hpt-tagline">AUS &middot; US &middot; India &middot; Forex &mdash; Gartley, Bat, Butterfly, Crab, Deep Crab, Cypher, Shark</div>
-    </div>
-</div>
-""", unsafe_allow_html=True)
-st.write("")
+st.title("\U0001F4C8 Harmonic Trading Dashboard")
+st.caption("AUS \u00b7 US \u00b7 India \u00b7 Forex -- Gartley, Bat, Butterfly, Crab, Deep Crab, Cypher, Shark")
 
 tab0, tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
-    "Overview", "Scan", "Backtest", "Watchlist",
-    "Open Trades", "Leaderboard", "Validation", "Settings"])
+    "\U0001F3E0 Live Overview", "\U0001F50D Scan Now", "\U0001F4CA Backtest", "\U0001F4CB Watchlist Scan",
+    "\U0001F4C8 Open Trades", "\U0001F3C6 Leaderboard", "\U0001F9EA Validation", "\u2699\uFE0F Settings"])
 
 # --- TAB 0: Live Overview ----------------------------------------------------
 with tab0:
@@ -370,16 +279,11 @@ with tab0:
         board_rows = lb.leaderboard_summary(board)
         top = next((r for r in board_rows if r["live_avg_r"] is not None), None)
 
-        c1, c2, c3, c4, c5 = st.columns(5)
+        c1, c2, c3, c4 = st.columns(4)
         c1.metric("\U0001F7E2 Open Trades", len(open_items))
         c2.metric("\U0001F440 Watching / Awaiting", len(pending_items))
         c3.metric("\u2705 Closed (tracked)", len(closed_items))
         c4.metric("\U0001F551 Last Scan", last_update[:16].replace("T", " ") if last_update else "No scans yet")
-        account = pa.load_account()
-        equity = pa.get_equity(account)
-        starting = account.get("starting_equity", config.PAPER_STARTING_EQUITY)
-        c5.metric("\U0001F4B0 Paper Equity", f"${equity:,.0f}",
-                  f"{((equity/starting)-1)*100:+.2f}%" if starting else None)
 
         if top:
             st.caption(f"\U0001F3C6 Best-performing combo so far: **{top['ticker']} {top['pattern']}** "
@@ -399,13 +303,9 @@ with tab0:
             for k, v in open_items.items():
                 direction_word = "LONG" if v["direction"] == "bullish" else "SHORT"
                 label = f"{v['ticker']} -- {v['pattern']} ({direction_word})"
-                realized = v.get("realized_pnl", 0.0)
-                risk_amt = v.get("risk_amount")
                 rows.append({"Setup": label, "Status": v["status"], "Entry": round(v["entry"], 4),
                              "Stop": round(v["stop"], 4), "T1": round(v["t1"], 4), "T2": round(v["t2"], 4),
-                             "T3": round(v["t3"], 4), "Fraction Left": f"{v.get('fraction_remaining', 1.0):.0%}",
-                             "Realized P&L": f"${realized:+,.2f}",
-                             "R (realized so far)": f"{realized/risk_amt:+.2f}R" if risk_amt else "--"})
+                             "T3": round(v["t3"], 4), "Fraction Left": f"{v.get('fraction_remaining', 1.0):.0%}"})
                 key_lookup[label] = k
             open_df = pd.DataFrame(rows)
             event = st.dataframe(open_df, use_container_width=True, hide_index=True,
@@ -547,13 +447,9 @@ with tab2:
             ec = res["equity_curve"]
             ec_df = pd.DataFrame(ec, columns=["date", "equity"])
             fig = go.Figure()
-            fig.add_trace(go.Scatter(x=ec_df["date"], y=ec_df["equity"], line=dict(color="#4FB0A2")))
+            fig.add_trace(go.Scatter(x=ec_df["date"], y=ec_df["equity"], line=dict(color="#26a69a")))
             fig.update_layout(title="Equity Curve", template="plotly_dark", height=350,
-                               paper_bgcolor="#0A0D12", plot_bgcolor="#10141B",
-                               font=dict(family="IBM Plex Sans, sans-serif", color="#E7E9EE"),
                                margin=dict(t=40, b=10, l=10, r=10))
-            fig.update_xaxes(gridcolor="#1B212B")
-            fig.update_yaxes(gridcolor="#1B212B")
             st.plotly_chart(fig, use_container_width=True)
 
             st.markdown("#### Performance by pattern type")
@@ -625,55 +521,16 @@ with tab4:
     st.subheader("Setups tracked by the scanner")
     st.caption("This reflects whatever the scanner (scanner.py, run via GitHub Actions) has found on its "
                "last run. Run the scanner at least once for this to show anything.")
-    st.caption("\u26A0\uFE0F **Paper trading, not live execution.** There is no broker/exchange connection "
-               "anywhere in this project. Every ENTER NOW alert opens a *simulated* position, sized off "
-               "the paper account below using RISK_PER_TRADE_PCT, and settles real P&L against it -- "
-               "no order is ever placed anywhere.")
-
-    account = pa.load_account()
     state = tm.load_state()
-
-    # --- paper account summary ------------------------------------------------
-    equity = pa.get_equity(account)
-    starting = account.get("starting_equity", config.PAPER_STARTING_EQUITY)
-    total_return_pct = ((equity / starting) - 1) * 100 if starting else 0.0
-    a1, a2, a3, a4 = st.columns(4)
-    a1.metric("Paper equity", f"${equity:,.2f}", f"{total_return_pct:+.2f}%")
-    a2.metric("Realized P&L (all-time)", f"${account.get('realized_pnl_total', 0.0):+,.2f}")
-    a3.metric("Starting balance", f"${starting:,.2f}")
-    a4.metric("Settled legs", account.get("n_closed_legs", 0))
-
-    curve = account.get("equity_curve", [])
-    if len(curve) > 1:
-        ec_fig = go.Figure()
-        ec_fig.add_trace(go.Scatter(
-            x=[pt["date"] for pt in curve], y=[pt["equity"] for pt in curve],
-            line=dict(color="#4FB0A2"), fill="tozeroy", fillcolor="rgba(79,176,162,0.08)"))
-        ec_fig.update_layout(title="Paper account equity", template="plotly_dark", height=260,
-                              paper_bgcolor="#0A0D12", plot_bgcolor="#10141B",
-                              font=dict(family="IBM Plex Sans, sans-serif", color="#E7E9EE"),
-                              margin=dict(t=40, b=10, l=10, r=10), showlegend=False)
-        ec_fig.update_xaxes(gridcolor="#1B212B")
-        ec_fig.update_yaxes(gridcolor="#1B212B")
-        st.plotly_chart(ec_fig, use_container_width=True)
-
-    st.divider()
-
     if not state:
         st.info("No tracked setups yet. Run the scanner at least once, or wait for the next scheduled scan.")
     else:
         status_order = {"OPEN": 0, "PARTIAL_T1": 1, "PARTIAL_T2": 2, "AWAITING_CONFIRMATION": 3,
-                         "WATCHING": 4, "CLOSED_T3": 5, "CLOSED_STOP": 6, "CLOSED_TRAILING": 6,
-                         "CLOSED_INVALIDATED": 7}
+                         "WATCHING": 4, "CLOSED_T3": 5, "CLOSED_STOP": 6, "CLOSED_INVALIDATED": 7}
         status_labels = {"OPEN": "\U0001F7E2 Open", "PARTIAL_T1": "\U0001F7E1 Partial (T1 hit)",
                           "PARTIAL_T2": "\U0001F7E1 Partial (T2 hit)", "AWAITING_CONFIRMATION": "\u23F3 Awaiting confirmation",
                           "WATCHING": "\U0001F440 Watching", "CLOSED_T3": "\u2705 Closed (T3)",
-                          "CLOSED_STOP": "\U0001F534 Closed (stop)", "CLOSED_TRAILING": "\U0001F535 Closed (trailing stop)",
-                          "CLOSED_INVALIDATED": "\u26AA Invalidated"}
-        event_labels = {"WATCHING": "\U0001F440", "AWAITING_CONFIRMATION": "\u23F3", "SUPPRESSED": "\U0001F6AB",
-                         "OPEN": "\U0001F7E2", "EXIT_PARTIAL_T1": "\U0001F7E1", "EXIT_PARTIAL_T2": "\U0001F7E1",
-                         "EXIT_FULL_T3": "\u2705", "EXIT_STOP": "\U0001F534", "EXIT_TRAILING_STOP": "\U0001F535",
-                         "INVALIDATED": "\u26AA"}
+                          "CLOSED_STOP": "\U0001F534 Closed (stop)", "CLOSED_INVALIDATED": "\u26AA Invalidated"}
 
         sorted_items = sorted(state.items(), key=lambda kv: status_order.get(kv[1]["status"], 9))
         active_items = [(k, v) for k, v in sorted_items if v["status"] in ("OPEN", "PARTIAL_T1", "PARTIAL_T2")]
@@ -687,73 +544,30 @@ with tab4:
 
         def render_setup_card(setup_id, s):
             direction_word = "LONG" if s["direction"] == "bullish" else "SHORT"
-            is_live = s["status"] in ("OPEN", "PARTIAL_T1", "PARTIAL_T2")
-            has_position = "units" in s
-
-            # fetch live data once -- used for both mark-to-market P&L and the chart
-            live_df, live_atr, current_price = None, None, None
-            try:
-                live_df = DEFAULT_SOURCE.fetch(s["ticker"], interval=s["timeframe"],
-                                                period=config.SCAN_PERIOD.get(s["market"], "1y"))
-                live_atr = _atr(live_df)
-                current_price = float(live_df["Close"].iloc[-1])
-            except Exception:
-                pass
-
-            pnl_suffix = ""
-            if has_position:
-                mtm = tm.mark_to_market(s, current_price if current_price is not None else s["entry"])
-                pnl_suffix = f" -- {'$' if mtm['total_pnl'] >= 0 else '-$'}{abs(mtm['total_pnl']):.2f}"
-
             with st.expander(f"{status_labels.get(s['status'], s['status'])} -- {s['ticker']} -- "
-                              f"{s['pattern']} ({direction_word}) -- {s['market']}/{s['timeframe']}{pnl_suffix}",
-                              expanded=is_live):
+                              f"{s['pattern']} ({direction_word}) -- {s['market']}/{s['timeframe']}",
+                              expanded=(s["status"] in ("OPEN", "PARTIAL_T1", "PARTIAL_T2"))):
                 c1, c2, c3, c4 = st.columns(4)
                 c1.metric("Entry", f"{s['entry']:.4f}")
                 c2.metric("Stop", f"{s['stop']:.4f}")
                 c3.metric("T1 / T2 / T3", f"{s['t1']:.4f} / {s['t2']:.4f} / {s['t3']:.4f}")
                 c4.metric("Fraction left", f"{s.get('fraction_remaining', 1.0):.0%}")
-
-                if has_position:
-                    mtm = tm.mark_to_market(s, current_price if current_price is not None else s["entry"])
-                    p1, p2, p3, p4 = st.columns(4)
-                    p1.metric("Position size", f"{s['units']:.4f} units")
-                    p2.metric("Realized P&L", f"${mtm['realized_pnl']:+,.2f}")
-                    if is_live:
-                        p3.metric("Unrealized P&L (mark-to-market)", f"${mtm['unrealized_pnl']:+,.2f}")
-                    else:
-                        p3.metric("Final P&L", f"${mtm['total_pnl']:+,.2f}")
-                    p4.metric("R-multiple", f"{mtm['r_multiple']:+.2f}R" if mtm["r_multiple"] is not None else "--")
-                    st.caption(f"Risked ${s.get('risk_amount', 0):.2f} "
-                               f"({config.RISK_PER_TRADE_PCT}% of ${s.get('equity_at_entry', 0):,.2f} "
-                               f"paper equity at entry).")
-
                 st.caption(f"Last update: {s.get('last_update', '?')}")
-
-                # --- what happened: the event timeline ------------------------
-                events = s.get("events", [])
-                if events:
-                    with st.expander("What happened on this setup", expanded=False):
-                        for e in reversed(events):
-                            icon = event_labels.get(e["event"], "\u2022")
-                            ts = e.get("ts", "")[:16].replace("T", " ")
-                            pnl_txt = f" (**${e['pnl']:+,.2f}**)" if e.get("pnl") is not None else ""
-                            st.markdown(f"{icon} `{ts}` **{e['event']}**{pnl_txt} -- {e.get('note', '')}")
 
                 pattern_obj = tm.reconstruct_pattern(s)
                 if pattern_obj is None:
                     st.info("This setup was tracked before chart data was stored -- no chart available "
                             "for it (will appear for setups tracked from now on).")
                     return
-                if live_df is not None:
-                    try:
-                        fig = plot_chart(live_df, [pattern_obj], title=f"{s['ticker']} -- {s['timeframe']}",
-                                          atr_series=live_atr)
-                        st.plotly_chart(fig, use_container_width=True, key=f"chart_{setup_id}")
-                    except Exception as e:
-                        st.warning(f"Could not render chart for {s['ticker']}: {e}")
-                else:
-                    st.warning(f"Could not load live chart data for {s['ticker']}.")
+                try:
+                    live_df = DEFAULT_SOURCE.fetch(s["ticker"], interval=s["timeframe"],
+                                                    period=config.SCAN_PERIOD.get(s["market"], "1y"))
+                    live_atr = _atr(live_df)
+                    fig = plot_chart(live_df, [pattern_obj], title=f"{s['ticker']} -- {s['timeframe']}",
+                                      atr_series=live_atr)
+                    st.plotly_chart(fig, use_container_width=True, key=f"chart_{setup_id}")
+                except Exception as e:
+                    st.warning(f"Could not load live chart for {s['ticker']}: {e}")
 
         if active_items:
             st.markdown("### Currently open")
@@ -767,10 +581,6 @@ with tab4:
 
         if closed_items:
             st.markdown("### Closed history")
-            total_closed_pnl = sum(v.get("realized_pnl", 0.0) for _, v in closed_items)
-            wins = sum(1 for _, v in closed_items if v.get("realized_pnl", 0.0) > 0)
-            st.caption(f"{wins}/{len(closed_items)} closed setups profitable -- "
-                       f"${total_closed_pnl:+,.2f} total realized P&L across all closed history shown below.")
             for setup_id, s in closed_items[:15]:
                 render_setup_card(setup_id, s)
             if len(closed_items) > 15:
