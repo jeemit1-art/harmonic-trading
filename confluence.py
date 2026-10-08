@@ -35,30 +35,32 @@ def rsi(series: pd.Series, period: int = 14) -> pd.Series:
 
 def check_rsi_divergence(df: pd.DataFrame, pattern, lookback: int = 30) -> dict:
     """
-    Bullish pattern -> want bullish (regular) divergence at D: price makes a
-    lower low than C, but RSI makes a higher low.
-    Bearish pattern -> want bearish divergence: price higher high than C,
-    RSI lower high.
+    Bullish pattern -> bullish (regular) divergence at D: price D is LOWER than the
+    previous swing LOW (B), but RSI at D is HIGHER than RSI at B.
+    Bearish pattern -> price D higher than previous swing HIGH (B), RSI lower.
+    (v2 fix: the original compared D against C, which is the OPPOSITE kind of
+    pivot -- a low vs a high -- so 'divergence' was almost never true and,
+    when it was, meant nothing.)
     """
     r = rsi(df['Close'])
     if pattern.D is None:
         return {"has_divergence": False, "note": "Pattern not yet confirmed (D not printed)"}
 
-    c_idx, d_idx = pattern.C.index, pattern.D.index
-    if c_idx >= len(r) or d_idx >= len(r) or pd.isna(r.iloc[c_idx]) or pd.isna(r.iloc[d_idx]):
+    b_idx, d_idx = pattern.B.index, pattern.D.index
+    if b_idx >= len(r) or d_idx >= len(r) or pd.isna(r.iloc[b_idx]) or pd.isna(r.iloc[d_idx]):
         return {"has_divergence": False, "note": "Insufficient data for RSI"}
 
-    rsi_c, rsi_d = r.iloc[c_idx], r.iloc[d_idx]
-    price_c, price_d = pattern.C.price, pattern.D.price
+    rsi_b, rsi_d = r.iloc[b_idx], r.iloc[d_idx]
+    price_b, price_d = pattern.B.price, pattern.D.price
 
     if pattern.direction.value == "bullish":
-        divergence = price_d < price_c and rsi_d > rsi_c
+        divergence = price_d < price_b and rsi_d > rsi_b
     else:
-        divergence = price_d > price_c and rsi_d < rsi_c
+        divergence = price_d > price_b and rsi_d < rsi_b
 
     return {
         "has_divergence": bool(divergence),
-        "rsi_at_C": round(float(rsi_c), 1),
+        "rsi_at_B": round(float(rsi_b), 1),
         "rsi_at_D": round(float(rsi_d), 1),
         "note": "Momentum confirms reversal" if divergence else "No RSI divergence -- weaker signal"
     }
@@ -126,21 +128,21 @@ def check_macd_divergence(df: pd.DataFrame, pattern) -> dict:
     if pattern.D is None:
         return {"has_divergence": False, "note": "Pattern not yet confirmed (D not printed)"}
     _, _, hist = macd(df['Close'])
-    c_idx, d_idx = pattern.C.index, pattern.D.index
-    if c_idx >= len(hist) or d_idx >= len(hist) or pd.isna(hist.iloc[c_idx]) or pd.isna(hist.iloc[d_idx]):
+    b_idx, d_idx = pattern.B.index, pattern.D.index
+    if b_idx >= len(hist) or d_idx >= len(hist) or pd.isna(hist.iloc[b_idx]) or pd.isna(hist.iloc[d_idx]):
         return {"has_divergence": False, "note": "Insufficient data for MACD"}
 
-    hist_c, hist_d = hist.iloc[c_idx], hist.iloc[d_idx]
-    price_c, price_d = pattern.C.price, pattern.D.price
+    hist_b, hist_d = hist.iloc[b_idx], hist.iloc[d_idx]
+    price_b, price_d = pattern.B.price, pattern.D.price
 
     if pattern.direction.value == "bullish":
-        divergence = price_d < price_c and hist_d > hist_c
+        divergence = price_d < price_b and hist_d > hist_b
     else:
-        divergence = price_d > price_c and hist_d < hist_c
+        divergence = price_d > price_b and hist_d < hist_b
 
     return {
         "has_divergence": bool(divergence),
-        "macd_hist_at_C": round(float(hist_c), 4),
+        "macd_hist_at_B": round(float(hist_b), 4),
         "macd_hist_at_D": round(float(hist_d), 4),
         "note": "MACD histogram confirms reversal" if divergence else "No MACD divergence"
     }

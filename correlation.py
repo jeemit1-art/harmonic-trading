@@ -36,8 +36,9 @@ TICKER_BUCKETS = {
 }
 
 
-def get_bucket(ticker: str) -> str:
-    return TICKER_BUCKETS.get(ticker, f"unclassified:{ticker}")
+def get_bucket(ticker: str, market: str = "") -> str:
+    # unknown tickers share one bucket PER MARKET (v1 gave each its own bucket, so caps never bound)
+    return TICKER_BUCKETS.get(ticker, f"market:{market}" if market else f"unclassified:{ticker}")
 
 
 def check_risk_caps(state: dict, market: str, ticker: str, pattern_name: str,
@@ -48,7 +49,7 @@ def check_risk_caps(state: dict, market: str, ticker: str, pattern_name: str,
     trade_state. Returns {"allowed": bool, "reason": str}.
     """
     risk_pct = risk_pct if risk_pct is not None else config.RISK_PER_TRADE_PCT
-    open_setups = [s for s in state.values() if s["status"] in ("OPEN", "PARTIAL_T1", "PARTIAL_T2")]
+    open_setups = [s for s in state.values() if s["status"] in ("PENDING", "OPEN", "PARTIAL_T1", "PARTIAL_T2")]
 
     # 1. overall concurrent-trade cap
     if len(open_setups) >= config.MAX_CONCURRENT_TRADES:
@@ -58,20 +59,21 @@ def check_risk_caps(state: dict, market: str, ticker: str, pattern_name: str,
 
     # 2. daily risk cap -- approximate open risk as risk_pct per open trade
     #    that hasn't reached breakeven yet (post-T1 trades risk ~0 on the stop)
-    at_risk_pct = sum(risk_pct if s["status"] == "OPEN" else 0 for s in open_setups)
+    at_risk_pct = sum(risk_pct if s["status"] in ("PENDING", "OPEN") else 0 for s in open_setups)
     if at_risk_pct + risk_pct > config.MAX_DAILY_RISK_PCT:
         return {"allowed": False,
                 "reason": f"Adding this trade would put ~{at_risk_pct + risk_pct:.1f}% of equity at risk "
                           f"simultaneously (cap: {config.MAX_DAILY_RISK_PCT}%). Skipping."}
 
     # 3. correlation cap -- same bucket AND same directional bias already open
-    new_bucket = get_bucket(ticker)
+    new_bucket = get_bucket(ticker, market)
     same_bucket_same_dir = [
         s for s in open_setups
-        if get_bucket(s["ticker"]) == new_bucket and s["direction"] == direction
+        if get_bucket(s["ticker"], s.get("market", "")) == new_bucket and s["direction"] == direction
         and s["ticker"] != ticker
     ]
-    max_correlated = getattr(config, "MAX_CORRELATED_TRADES", 2)
+    max_correlated = (getattr(config, "MAX_SAME_DIR_PER_MARKET", 3) if new_bucket.startswith("market:")
+                      else getattr(config, "MAX_CORRELATED_TRADES", 2))
     if len(same_bucket_same_dir) >= max_correlated:
         others = ", ".join(s["ticker"] for s in same_bucket_same_dir)
         return {"allowed": False,

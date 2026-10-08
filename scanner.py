@@ -1,286 +1,200 @@
 """
-Market scanner. Run this on a schedule (cron / systemd timer, see
-DEPLOYMENT.md) on your cloud VM. Each run:
+Scanner v2. One run = one market, on CLOSED bars only. Order of operations
+(the order is the fix for "alerts after the stop was hit"):
 
-  1. Pulls latest data for every ticker in every watchlist.
-  2. Checks the volatility/liquidity regime -- skips tickers in a known
-     bad regime (thin volume, extreme volatility, holiday period).
-  3. Detects confirmed AND forming harmonic patterns.
-  4. Scores confluence (RSI/MACD divergence, volume, ADX, candlestick
-     confirmation, higher-timeframe trend).
-  5. Checks the leaderboard -- suppresses ENTER NOW for (market, ticker,
-     pattern) combos with a demonstrably weak track record.
-  6. Checks news/earnings blackout -- suppresses ENTER NOW near known
-     high-impact events.
-  7. Checks risk/correlation caps -- suppresses ENTER NOW if it would
-     breach max concurrent trades, max daily risk, or correlated exposure.
-  8. Advances each setup's tracked state (trade_manager.py) and fires the
-     appropriate explicit alert: WATCHING, AWAITING confirmation,
-     ENTER NOW, or EXIT NOW (partial/full/stop/trailing-stop).
-  9. Records closed trades to the leaderboard for future suppression checks.
+  1. fetch closed bars for the whole market (batched)
+  2. MANAGE open positions FIRST -- replay every bar since last run, in order,
+     handle several transitions at once, alert each exactly once. This happens
+     whether or not the pattern is still detectable (v1 only managed trades
+     whose pattern was re-detected, so many were never checked again).
+  3. look for NEW signals on tickers with no open position
+  4. gate (plan geometry, path check, regime, leaderboard, news, risk caps)
+  5. queue alerts in the outbox, then deliver; undelivered alerts retry next run
+  6. save state atomically
 
-Usage:
-    python3 scanner.py                 # scan everything once
-    python3 scanner.py --market FOREX  # scan a single market
+    python scanner.py --market AUS
+    python scanner.py --market FOREX --dry-run     # no Telegram, no state write
 """
-import argparse
-import sys
-import traceback
+import argparse, sys, traceback
 from datetime import datetime, timezone
 
-import pandas as pd
-
 import config
-from data_sources import DEFAULT_SOURCE, WATCHLISTS
-from patterns import find_patterns
-from confluence import score_confluence
-from telegram_alert import (send_telegram_message, format_pattern_alert, format_action_alert,
-                             send_telegram_photo, format_enter_now_caption)
-from backtest import _atr, estimate_time_to_targets
-import trade_manager as tm
+import state as st
 import leaderboard as lb
 import correlation as corr
 import regime_filter as rf
 import news_filter as nf
-from chart_image import generate_pattern_chart
+import telegram_alert as tg
+from data_sources import DEFAULT_SOURCE, WATCHLISTS
+from patterns import find_patterns
+from engine import (evaluate_signal, build_plan, check_plan, new_position, advance_position,
+                    atr_series, OPEN_STATES)
+from confluence import score_confluence
 
-# Only these actions actually get pushed to Telegram by default -- WATCHING
-# alerts are informational and can flood your phone if left on. Flip
-# ALERT_ON_WATCHING to True if you want the heads-up messages too.
-ALERT_ON_WATCHING = False
-ALERT_ON_AWAITING = False
-
-CLOSED_ACTIONS = ("EXIT_FULL_T3", "EXIT_STOP", "EXIT_TRAILING_STOP")
-PARTIAL_ACTIONS = ("EXIT_PARTIAL_T1", "EXIT_PARTIAL_T2")
+ALERT_ON_WATCHING = False       # forming-pattern heads-up (noisy; off by default)
 
 
-def scan_ticker(market: str, ticker: str, state: dict, board: dict) -> int:
-    tf = config.SCAN_TIMEFRAMES[market]
-    period = config.SCAN_PERIOD[market]
-    deviation = config.ZIGZAG_DEVIATION[market]
+def _log(msg):
+    print(f"[{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')}Z] {msg}", flush=True)
 
-    df = DEFAULT_SOURCE.fetch(ticker, interval=tf, period=period)
-    if len(df) < 60:
-        return 0
 
-    atr = _atr(df)
-    current_atr = float(atr.iloc[-1]) if not pd.isna(atr.iloc[-1]) else None
+def _once(state, key, ttl_note="") -> bool:
+    """True the first time a key is seen (used to avoid logging the same suppression every run)."""
+    if key in state["seen"]:
+        return False
+    state["seen"][key] = st.now_iso()
+    return True
 
-    # regime check -- skip new entries (but still process existing open
-    # trades' exits below) if conditions are bad for trusting new signals
-    regime = rf.assess_regime(df, atr)
-    regime_ok = regime["tradeable_regime"]
-    if not regime_ok:
-        print(f"[{datetime.now(timezone.utc).isoformat()}] REGIME WARNING {market} {ticker}: "
-              f"{regime['volume']['note']} {regime['volatility']['note']}")
 
-    patterns = find_patterns(df, deviation_pct=deviation, tolerance=config.RATIO_TOLERANCE)
-    if not patterns:
-        return 0
+def manage_positions(state: dict, board: dict, market: str, ticker: str, df, atr) -> int:
+    n = 0
+    for pid, pos in list(state["positions"].items()):
+        if pos["market"] != market or pos["ticker"] != ticker:
+            continue
+        pos["last_close"], pos["last_close_ts"], pos["data_fail_runs"] = float(df["Close"].iloc[-1]), str(df.index[-1]), 0
+        for ev in advance_position(pos, df, atr):
+            st.queue_alert(state, tg.fmt_event(pos, ev), ev["type"], ticker, pid)
+            _log(f"{ev['type']} {market} {ticker} {pos['pattern']} @ {ev['price']:.5f}")
+            n += 1
+        if pos["status"].startswith("CLOSED"):
+            state["closed"].append(pos)
+            del state["positions"][pid]
+            if pos.get("r_multiple") is not None and pos["status"] != "CLOSED_INVALIDATED":
+                lb.record_outcome(board, market, ticker, pos["pattern"], pos["r_multiple"], source="live")
+    return n
 
-    htf_df = None
-    try:
-        if tf != "1d":
-            htf_df = DEFAULT_SOURCE.fetch(ticker, interval="1d", period="2y")
-    except Exception:
-        htf_df = None
 
-    current_price = float(df['Close'].iloc[-1])
-    current_high = float(df['High'].iloc[-1])
-    current_low = float(df['Low'].iloc[-1])
-    n_sent = 0
-
+def find_new_signal(state, market, ticker, df, atr, deviation):
+    patterns = find_patterns(df, deviation_pct=deviation, tolerance=config.RATIO_TOLERANCE,
+                             include_forming=False, include_tentative=config.USE_TENTATIVE_D)
+    close = float(df["Close"].iloc[-1])
+    cands = []
     for p in patterns:
-        if p.quality_score < config.MIN_QUALITY_SCORE:
+        if p.D is None:
             continue
-
-        bullish = p.direction.value == "bullish"
-        key_point = p.D.index if p.D is not None else p.C.index
-
-        # RECENCY FILTER: skip anything whose reversal point isn't recent.
-        # Without this, a scan of a year of history will happily surface
-        # patterns that completed months ago as if they were live signals --
-        # that's how you get an "entry" price nowhere near the current
-        # market price. Only patterns within the last MAX_PATTERN_AGE_BARS
-        # bars are considered live/actionable.
-        bars_old = (len(df) - 1) - key_point
-        if bars_old > config.MAX_PATTERN_AGE_BARS:
+        sig = evaluate_signal(df, p)
+        if sig is None:
             continue
-
-        # STABLE setup ID: use the pivot's actual timestamp, not its
-        # positional array index. The lookback window slides forward every
-        # scan (old bars age out, new ones arrive), so a positional index
-        # for the same real-world pivot can drift between runs -- using the
-        # timestamp instead means the same real pattern is recognized as
-        # "already tracked" correctly across scans, rather than looking
-        # like a brand new setup every single run.
-        x_key = p.X.timestamp.isoformat() if hasattr(p.X.timestamp, "isoformat") else str(p.X.timestamp)
-        setup_id = tm.make_setup_id(market, ticker, tf, p.name, x_key)
-
-        conf = score_confluence(df, p, htf_df=htf_df)
-
-        if p.D is not None:
-            entry = p.D.price
-        else:
-            entry = (p.prz_lo + p.prz_hi) / 2
-
-        idx = min(key_point, len(atr) - 1)
-        buffer = (atr.iloc[idx] if not pd.isna(atr.iloc[idx]) else 0) * config.ATR_STOP_BUFFER
-        stop = (p.X.price - buffer) if bullish else (p.X.price + buffer)
-        cd_leg = abs(p.C.price - entry)
-        t1 = entry + 0.382 * cd_leg if bullish else entry - 0.382 * cd_leg
-        t2 = entry + 0.618 * cd_leg if bullish else entry - 0.618 * cd_leg
-        t3 = p.A.price
-
-        # ACTIONABILITY CHECK: even a recent pattern can already be "missed"
-        # if price has run away from entry by the time the scan runs. Skip
-        # rather than alert on an entry that's no longer realistically
-        # reachable at a sane risk:reward.
-        entry_deviation_pct = abs(current_price - entry) / entry * 100 if entry else 0
-        price_still_actionable = entry_deviation_pct <= config.MAX_ENTRY_DEVIATION_PCT
-
-        # gate entry_ready: regime must be OK AND price must still be
-        # actionable -- applied on EVERY scan, not just when the setup is
-        # first created. This is critical: a pattern can sit in
-        # AWAITING_CONFIRMATION for many scan cycles while price drifts
-        # away, and only get its candlestick/momentum confirmation much
-        # later. Without re-checking staleness on every scan (not just at
-        # creation), a setup that was fresh when first spotted but is now
-        # stale by the time it finally "confirms" would incorrectly fire
-        # ENTER_NOW regardless of how far price has since moved.
-        gated_conf = dict(conf)
-        if not regime_ok:
-            gated_conf["entry_ready"] = False
-        if not price_still_actionable:
-            gated_conf["entry_ready"] = False
-
-        # if an already-tracked setup has drifted too stale to ever be
-        # actionable again, close it out explicitly instead of leaving it
-        # stuck silently in AWAITING_CONFIRMATION/WATCHING forever
-        existing_setup = state.get(setup_id)
-        if existing_setup and existing_setup["status"] in ("AWAITING_CONFIRMATION", "WATCHING"):
-            if bars_old > config.MAX_PATTERN_AGE_BARS or not price_still_actionable:
-                existing_setup["status"] = "CLOSED_INVALIDATED"
-                existing_setup["last_update"] = datetime.now(timezone.utc).isoformat()
-                print(f"[{datetime.now(timezone.utc).isoformat()}] EXPIRED (stale) {market} {ticker} {p.name}: "
-                      f"bars_old={bars_old} price_dev={entry_deviation_pct:.2f}%")
-                continue
-
-        result = tm.update_setup(state, setup_id, market, ticker, tf, p, gated_conf,
-                                  current_price, entry, stop, t1, t2, t3, atr=current_atr,
-                                  bar_high=current_high, bar_low=current_low)
-        action = result["action"]
-        setup = result["setup"]
-
-        if action == "ENTER_NOW":
-            # leaderboard suppression check
-            suppress = lb.should_suppress(board, market, ticker, p.name)
-            if suppress["suppress"]:
-                print(f"[{datetime.now(timezone.utc).isoformat()}] SUPPRESSED (leaderboard) "
-                      f"{market} {ticker} {p.name}: {suppress['reason']}")
-                # roll the state back to AWAITING so it can re-trigger later if the
-                # track record improves, rather than silently losing the setup
-                setup["status"] = "AWAITING_CONFIRMATION"
-                continue
-
-            # news/earnings blackout check
-            news = nf.check_news_blackout(ticker, market)
-            if news["blackout"]:
-                print(f"[{datetime.now(timezone.utc).isoformat()}] SUPPRESSED (news blackout) "
-                      f"{market} {ticker} {p.name}: {news['earnings']['note']} {news['macro']['note']}")
-                setup["status"] = "AWAITING_CONFIRMATION"
-                continue
-
-            # risk/correlation cap check
-            risk_check = corr.check_risk_caps(state, market, ticker, p.name, p.direction.value)
-            if not risk_check["allowed"]:
-                print(f"[{datetime.now(timezone.utc).isoformat()}] SUPPRESSED (risk cap) "
-                      f"{market} {ticker} {p.name}: {risk_check['reason']}")
-                setup["status"] = "AWAITING_CONFIRMATION"
-                continue
-
-            eta = None
-            try:
-                eta = estimate_time_to_targets(df, p.name, deviation_pct=deviation,
-                                                tolerance=config.RATIO_TOLERANCE)
-            except Exception:
-                pass
-
-            # send the chart image first (with a short caption), then the
-            # full detailed text -- if image generation fails for any
-            # reason, fall back to text-only rather than losing the alert
-            try:
-                img_bytes = generate_pattern_chart(df, p, entry, stop, t1, t2, t3,
-                                                    ticker, market, tf, status="CONFIRMED")
-                caption = format_enter_now_caption(setup, current_price, confluence=conf)
-                send_telegram_photo(img_bytes, caption=caption)
-            except Exception as e:
-                print(f"[scanner] Chart image generation/send failed for {ticker}: {e}")
-
-            msg = format_action_alert("ENTER_NOW", setup, current_price, confluence=conf, eta=eta)
-            ok = send_telegram_message(msg)
-            n_sent += 1
-            print(f"[{datetime.now(timezone.utc).isoformat()}] ENTER_NOW {market} {ticker} "
-                  f"{p.name} score={p.quality_score} {'sent' if ok else 'queued (no telegram)'}")
-
-        elif action in PARTIAL_ACTIONS + CLOSED_ACTIONS:
-            msg = format_action_alert(action, setup, current_price)
-            ok = send_telegram_message(msg)
-            n_sent += 1
-            print(f"[{datetime.now(timezone.utc).isoformat()}] {action} {market} {ticker} {p.name} "
-                  f"{'sent' if ok else 'queued (no telegram)'}")
-
-            if action in CLOSED_ACTIONS:
-                # record the realized outcome to the leaderboard. Approximate
-                # the closed trade's blended R the same way the backtester
-                # does isn't available live without re-deriving it exactly,
-                # so use the fraction-weighted price move vs initial risk as
-                # a reasonable live proxy.
-                initial_risk = abs(setup["entry"] - setup.get("original_stop", setup["entry"]))
-                if initial_risk > 0:
-                    sign = 1 if bullish else -1
-                    approx_r = sign * (current_price - setup["entry"]) / initial_risk
-                    board = lb.record_outcome(board, market, ticker, p.name, approx_r, source="live")
-
-        elif action == "SETUP_INVALIDATED":
-            print(f"[{datetime.now(timezone.utc).isoformat()}] INVALIDATED {market} {ticker} {p.name}")
-
-        elif action == "AWAITING" and ALERT_ON_AWAITING:
-            msg = format_pattern_alert(market, ticker, tf, p, entry, stop, t1, t2, t3, conf, "WATCHING")
-            send_telegram_message(msg)
-            n_sent += 1
-
-        elif action == "WATCHING" and ALERT_ON_WATCHING:
-            msg = format_pattern_alert(market, ticker, tf, p, entry, stop, t1, t2, t3, conf, "WATCHING")
-            send_telegram_message(msg)
-            n_sent += 1
-
-    return n_sent
+        sid = f"{ticker}:{p.direction.value}:{p.D.timestamp}"
+        if sid in state["seen"]:
+            continue
+        plan = build_plan(df, p, atr)
+        ok, why = check_plan(df, p, plan, close)
+        if not ok:
+            state["seen"][sid] = st.now_iso()            # definitive: don't re-evaluate every run
+            st.log_decision(state, market, ticker, f"REJECTED {p.name}", why)
+            continue
+        cands.append((p.quality_score, p, plan, sid, sig))
+    return max(cands, key=lambda c: c[0]) if cands else None
 
 
-def run_scan(markets: list[str] = None):
+def process_ticker(state, board, market, ticker, df, tf, dry) -> tuple[int, int]:
+    deviation = config.ZIGZAG_DEVIATION[market]
+    atr = atr_series(df)
+    n_events = manage_positions(state, board, market, ticker, df, atr)
+    if any(p["ticker"] == ticker and p["market"] == market for p in state["positions"].values()):
+        return n_events, 0                                  # one position per ticker
+
+    best = find_new_signal(state, market, ticker, df, atr, deviation)
+    if best is None:
+        return n_events, 0
+    _, p, plan, sid, sig = best
+
+    def suppress(kind, why):
+        if _once(state, f"{sid}|{kind}"):
+            st.log_decision(state, market, ticker, f"SUPPRESSED {p.name} ({kind})", why)
+            _log(f"SUPPRESSED ({kind}) {market} {ticker} {p.name}: {why}")
+        return n_events, 0
+
+    regime = rf.assess_regime(df, atr)
+    if not regime["tradeable_regime"]:
+        return suppress("regime", f"{regime['volume']['note']} {regime['volatility']['note']}")
+    sup = lb.should_suppress(board, market, ticker, p.name)
+    if sup["suppress"]:
+        return suppress("leaderboard", sup["reason"])
+    news = nf.check_news_blackout(ticker, market)
+    if news["blackout"]:
+        return suppress("news", f"{news['earnings'].get('note','')} {news['macro'].get('note','')}")
+    caps = corr.check_risk_caps(state["positions"], market, ticker, p.name, p.direction.value)
+    if not caps["allowed"]:
+        return suppress("risk_cap", caps["reason"])
+
+    conf = score_confluence(df, p)
+    pos = new_position(p, plan, market, ticker, tf, df.index[-1], sid,
+                       {"candle": sig["candle"].get("type"), "rsi": sig["rsi"].get("has_divergence"),
+                        "macd": sig["macd"].get("has_divergence"), "adx": conf["adx"].get("adx"),
+                        "adjusted_score": conf["adjusted_score"], "tentative_D": p.tentative})
+    close = float(df["Close"].iloc[-1])
+    notes = [f"Trigger: {sig['candle'].get('type')} candle at the PRZ"
+             + (" (D not yet a confirmed pivot -- early entry)" if p.tentative else ""),
+             f"Momentum: RSI div {sig['rsi'].get('has_divergence')}, MACD div {sig['macd'].get('has_divergence')}",
+             f"Ratios: " + ", ".join(f"{k} {v}" for k, v in p.ratios.items() if v is not None),
+             f"HTF/ADX: {conf['adx']['note']}"]
+    if not dry:
+        try:
+            from chart_image import generate_pattern_chart
+            img = generate_pattern_chart(df, p, close, plan["stop"], plan["t1"], plan["t2"], plan["t3"],
+                                         ticker, market, tf, status="SIGNAL")
+            tg.send_photo(img, caption=f"{ticker} {p.name} {'LONG' if pos['direction']=='bullish' else 'SHORT'}")
+        except Exception as e:
+            _log(f"chart failed for {ticker}: {e}")
+    state["positions"][pos["id"]] = pos
+    state["seen"][sid] = st.now_iso()
+    st.queue_alert(state, tg.fmt_signal(pos, close, notes), "SIGNAL", ticker, pos["id"])
+    _log(f"SIGNAL {market} {ticker} {p.name} q={p.quality_score} stop={plan['stop']:.5f}")
+    return n_events, 1
+
+
+def run_scan(markets=None, dry=False, state_path=None) -> dict:
+    state, board = st.load(state_path), lb.load_leaderboard()
     markets = markets or list(WATCHLISTS.keys())
-    state = tm.load_state()
-    board = lb.load_leaderboard()
-    total_new = 0
-
     for market in markets:
-        for ticker in WATCHLISTS[market]:
+        tf, period = config.SCAN_TIMEFRAMES[market], config.SCAN_PERIOD[market]
+        tickers = WATCHLISTS[market]
+        _log(f"== {market}: {len(tickers)} tickers, {tf}, {period}")
+        try:
+            data = DEFAULT_SOURCE.fetch_many(tickers, tf, period, market)
+        except Exception as e:
+            _log(f"fetch failed for {market}: {e}")
+            traceback.print_exc()
+            data = {}
+        signals = events = 0
+        for ticker in tickers:
+            df = data.get(ticker)
+            if df is None or len(df) < 60:
+                for pos in state["positions"].values():          # tell the user if an OPEN trade went blind
+                    if pos["ticker"] == ticker and pos["market"] == market:
+                        pos["data_fail_runs"] = pos.get("data_fail_runs", 0) + 1
+                        if pos["data_fail_runs"] == 3:
+                            st.queue_alert(state, f"DATA PROBLEM: no price data for {ticker} for 3 runs. "
+                                                  f"Open {pos['pattern']} trade is NOT being tracked -- manage it manually.",
+                                           "DATA", ticker, pos["id"])
+                continue
             try:
-                total_new += scan_ticker(market, ticker, state, board)
-            except Exception as e:
-                print(f"[scanner] ERROR scanning {market}:{ticker} -- {e}", file=sys.stderr)
+                e, s = process_ticker(state, board, market, ticker, df, tf, dry)
+                events, signals = events + e, signals + s
+            except Exception as ex:
+                _log(f"ERROR {market}:{ticker} -- {ex}")
                 traceback.print_exc()
-
-    state = tm.prune_closed(state)
-    tm.save_state(state)
-    lb.save_leaderboard(board)
-    print(f"\nScan complete. {total_new} alert(s) sent.")
+        ok = len(data) >= 0.5 * len(tickers)
+        state["meta"]["markets"][market] = {
+            "last_run": st.now_iso(), "last_success": st.now_iso() if ok else state["meta"]["markets"].get(market, {}).get("last_success"),
+            "tickers_ok": len(data), "tickers_total": len(tickers), "signals": signals, "events": events}
+        n_open = sum(1 for p in state["positions"].values() if p["market"] == market)
+        st.queue_alert(state, f"{'SCAN OK' if ok else 'SCAN DEGRADED'} {market} {tf}: {len(data)}/{len(tickers)} tickers, "
+                              f"{signals} new signal(s), {events} trade event(s), {n_open} open.", "SUMMARY") \
+            if getattr(config, "SEND_SUMMARY", True) else None
+    state["meta"]["last_run"] = st.now_iso()
+    if not dry:
+        _log(f"delivery: {tg.flush_outbox(state)}")
+        st.save(state, state_path)
+        lb.save_leaderboard(board)
+    return state
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--market", choices=list(WATCHLISTS.keys()), default=None,
-                         help="Scan a single market only (default: all)")
-    args = parser.parse_args()
-    run_scan([args.market] if args.market else None)
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--market", choices=list(WATCHLISTS.keys()))
+    ap.add_argument("--dry-run", action="store_true", help="no Telegram, no state write")
+    a = ap.parse_args()
+    run_scan([a.market] if a.market else None, dry=a.dry_run)

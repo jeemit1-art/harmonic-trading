@@ -1,238 +1,105 @@
 """
-Sends formatted trade-setup alerts to Telegram. Requires TELEGRAM_BOT_TOKEN
-and TELEGRAM_CHAT_ID to be set in config.py (see the instructions there).
+Telegram delivery. PLAIN TEXT on purpose: v1 used parse_mode=Markdown with raw
+dict reprs and underscores, which Telegram rejects with HTTP 400 -- and v1 then
+advanced state anyway, so the alert was lost forever. v2 queues every alert in
+state['outbox'] and only removes it after Telegram answers ok=true.
 """
 import requests
 import config
+import state as st
+
+MAX_ATTEMPTS = 12
 
 
-def send_telegram_message(text: str) -> bool:
-    if "PASTE_YOUR" in config.TELEGRAM_BOT_TOKEN:
-        print("[telegram_alert] Bot token not configured -- skipping send. "
-              "Message would have been:\n" + text)
-        return False
-    url = f"https://api.telegram.org/bot{config.TELEGRAM_BOT_TOKEN}/sendMessage"
+def _configured() -> bool:
+    return "PASTE_YOUR" not in config.TELEGRAM_BOT_TOKEN and bool(config.TELEGRAM_CHAT_ID) \
+        and "PASTE_YOUR" not in config.TELEGRAM_CHAT_ID
+
+
+def send_message(text: str) -> tuple[bool, str]:
+    if not _configured():
+        return False, "telegram not configured"
     try:
-        resp = requests.post(url, data={
-            "chat_id": config.TELEGRAM_CHAT_ID,
-            "text": text,
-            "parse_mode": "Markdown",
-        }, timeout=10)
-        return resp.status_code == 200
+        r = requests.post(f"https://api.telegram.org/bot{config.TELEGRAM_BOT_TOKEN}/sendMessage",
+                          data={"chat_id": config.TELEGRAM_CHAT_ID, "text": text[:4000],
+                                "disable_web_page_preview": True}, timeout=15)
+        ok = r.status_code == 200 and r.json().get("ok", False)
+        return ok, "" if ok else f"HTTP {r.status_code}: {r.text[:150]}"
     except Exception as e:
-        print(f"[telegram_alert] Failed to send: {e}")
-        return False
+        return False, str(e)
 
 
-def send_telegram_photo(image_bytes: bytes, caption: str = "") -> bool:
-    """
-    Sends a chart image as a Telegram photo, with a short caption (Telegram
-    caps photo captions at 1024 characters -- keep it brief; send the full
-    detailed text as a separate follow-up message via send_telegram_message
-    if you need the complete reasoning/ratios/etc alongside the image).
-    """
-    if "PASTE_YOUR" in config.TELEGRAM_BOT_TOKEN:
-        print("[telegram_alert] Bot token not configured -- skipping photo send.")
+def send_photo(image_bytes: bytes, caption: str = "") -> bool:
+    if not _configured():
         return False
-    url = f"https://api.telegram.org/bot{config.TELEGRAM_BOT_TOKEN}/sendPhoto"
     try:
-        resp = requests.post(
-            url,
-            data={"chat_id": config.TELEGRAM_CHAT_ID, "caption": caption[:1024], "parse_mode": "Markdown"},
-            files={"photo": ("chart.png", image_bytes, "image/png")},
-            timeout=20,
-        )
-        if resp.status_code != 200:
-            print(f"[telegram_alert] Photo send failed: {resp.status_code} {resp.text[:200]}")
-        return resp.status_code == 200
-    except Exception as e:
-        print(f"[telegram_alert] Failed to send photo: {e}")
+        r = requests.post(f"https://api.telegram.org/bot{config.TELEGRAM_BOT_TOKEN}/sendPhoto",
+                          data={"chat_id": config.TELEGRAM_CHAT_ID, "caption": caption[:1000]},
+                          files={"photo": ("chart.png", image_bytes, "image/png")}, timeout=30)
+        return r.status_code == 200
+    except Exception:
         return False
 
 
-def format_pattern_alert(market: str, ticker: str, timeframe: str, pattern,
-                          entry: float, stop: float, t1: float, t2: float, t3: float,
-                          confluence: dict, status: str) -> str:
-    """
-    status: 'CONFIRMED' (D printed, trade the PRZ now) or 'WATCHING'
-    (approaching PRZ, not confirmed yet -- heads up only).
-    """
-    direction_word = "LONG" if pattern.direction.value == "bullish" else "SHORT"
-    risk_per_unit = abs(entry - stop)
-    reward_t2 = abs(t2 - entry)
-    rr = round(reward_t2 / risk_per_unit, 2) if risk_per_unit else None
-
-    rsi_note = confluence["rsi"]["note"]
-    vol_note = confluence["volume"]["note"]
-    htf_note = confluence["htf_trend"]["note"]
-
-    emoji = "\U0001F7E2" if status == "CONFIRMED" else "\U0001F440"
-
-    lines = [
-        f"{emoji} *{status}: {pattern.name} ({direction_word})*",
-        f"*{ticker}* -- {market} -- {timeframe}",
-        "",
-        f"*Why this trade:* A {pattern.name} pattern has "
-        f"{'completed' if status == 'CONFIRMED' else 'nearly completed'} at point D, "
-        f"projecting a {'reversal higher' if direction_word == 'LONG' else 'reversal lower'} "
-        f"from the {'X-A-B-C swing' if not pattern.ratios.get('CD/XC') else 'X-C swing'}.",
-        f"Ratio quality score: {confluence['base_quality_score']}/100 "
-        f"(confluence-adjusted: {confluence['adjusted_score']}/100).",
-        f"RSI: {rsi_note}",
-        f"Volume: {vol_note}",
-        f"HTF trend: {htf_note}",
-        "",
-        f"*Entry:* {entry:.5f}  (PRZ)",
-        f"*Stop Loss:* {stop:.5f}  (beyond point X + ATR buffer)",
-        f"*Target 1 (0.382 of CD):* {t1:.5f} -- close 1/3, move stop to breakeven",
-        f"*Target 2 (0.618 of CD):* {t2:.5f} -- close 1/3",
-        f"*Target 3 (point A):* {t3:.5f} -- close remainder / trail",
-        f"*Risk:Reward to T2:* ~{rr}R" if rr else "",
-        "",
-        f"Ratios: {pattern.ratios}",
-    ]
-    return "\n".join(l for l in lines if l is not None)
+def flush_outbox(state: dict) -> dict:
+    """Deliver queued alerts in order. Undelivered ones stay queued for the next run."""
+    sent = failed = 0
+    keep = []
+    for a in state["outbox"]:
+        ok, err = send_message(a["text"])
+        if ok:
+            sent += 1
+            state["alert_log"].append({"t": st.now_iso(), "kind": a["kind"], "ticker": a["ticker"],
+                                       "text": a["text"], "queued_at": a["created"]})
+        else:
+            a["attempts"] += 1
+            a["last_error"] = err
+            failed += 1
+            if a["attempts"] < MAX_ATTEMPTS:
+                keep.append(a)
+            else:
+                st.log_decision(state, "", a["ticker"], "ALERT_DROPPED", f"gave up after {MAX_ATTEMPTS} attempts: {err}")
+    state["outbox"] = keep
+    return {"sent": sent, "failed": failed}
 
 
-def _format_eta_line(eta: dict) -> str:
-    if not eta or not eta.get("timing"):
-        return ""
-    t1 = eta["timing"].get("T1", {})
-    t2 = eta["timing"].get("T2", {})
-    if not t1 or t1.get("n_reached", 0) == 0:
-        return "\n_No historical timing data yet for this instrument/pattern._"
-    basis = "this exact pattern" if eta.get("specific") else "this instrument (blended across pattern types)"
-    lines = [f"\n*Historical timing* (based on {eta['n_trades_used']} past trades on {basis}):"]
-    if t1.get("n_reached"):
-        lines.append(f"  T1 typically hit in ~{t1['median_bars']} bars (median), range {t1['min_bars']}-{t1['max_bars']}")
-    if t2.get("n_reached"):
-        lines.append(f"  T2 typically hit in ~{t2['median_bars']} bars (median), range {t2['min_bars']}-{t2['max_bars']}")
-    lines.append("_This is a statistical tendency from past trades, not a guarantee._")
+# ----------------------------------------------------------------------------- formatting
+def _side(pos): return "LONG" if pos["direction"] == "bullish" else "SHORT"
+
+
+def _fmt(x: float) -> str:
+    return f"{x:.5f}" if abs(x) < 20 else f"{x:.2f}"
+
+
+def fmt_signal(pos: dict, ref_close: float, notes: list[str]) -> str:
+    risk_pct = abs(ref_close - pos["stop"]) / ref_close * 100
+    lines = [f"NEW SIGNAL: {_side(pos)} {pos['ticker']}  ({pos['market']} {pos['timeframe']})",
+             f"{pos['pattern']}  quality {pos['quality']}", "",
+             f"Reference close: {_fmt(ref_close)}",
+             f"ENTRY: at the next bar's open (market)",
+             f"DO NOT CHASE beyond: {_fmt(pos['max_chase'])}  (R:R to T2 falls below {config.MIN_RR_T2})",
+             f"STOP: {_fmt(pos['stop'])}   (~{risk_pct:.2f}% risk) -> place it at your broker with the entry",
+             f"T1 {_fmt(pos['t1'])} (close 1/3, stop to breakeven)",
+             f"T2 {_fmt(pos['t2'])} (close 1/3)",
+             f"T3 {_fmt(pos['t3'])} (trail the rest)" if not config.USE_TRAILING_STOP_AFTER_T2
+             else f"Last third: trail {config.TRAILING_ATR_MULT}x ATR (no fixed T3)",
+             f"Time stop: {config.MAX_HOLD_BARS} bars", ""] + notes
     return "\n".join(lines)
 
 
-def format_action_alert(action: str, setup: dict, current_price: float, confluence: dict = None,
-                         eta: dict = None) -> str:
-    """
-    Builds the explicit, unambiguous action message. This is the one that
-    matters for actually trading -- the pattern-completion alert above is
-    informational; these are the "do something now" messages, generated by
-    trade_manager.py as a setup advances through its lifecycle.
-    """
-    ticker, market, tf = setup["ticker"], setup["market"], setup["timeframe"]
-    pattern_name, direction = setup["pattern"], setup["direction"]
-    direction_word = "LONG" if direction == "bullish" else "SHORT"
-
-    if action == "ENTER_NOW":
-        header = f"\U0001F7E2\U0001F7E2 *ENTER NOW -- {direction_word} {ticker}*"
-        reason = (
-            f"{pattern_name} pattern completed AND price has printed a confirmation candle "
-            f"AND momentum (RSI or MACD) confirms the reversal. All three conditions are met -- "
-            f"this is a full trade signal, not just a watch."
-        )
-        body = [
-            header,
-            f"*{ticker}* -- {market} -- {tf}   *{pattern_name}* ({direction_word})",
-            "",
-            f"*Reason:* {reason}",
-            "",
-            f"*ENTRY:* {setup['entry']:.5f}  (current price: {current_price:.5f})",
-            f"*STOP LOSS:* {setup['stop']:.5f}",
-            f"*TARGET 1 (0.382 CD):* {setup['t1']:.5f} -- close 1/3, then move stop to breakeven",
-            f"*TARGET 2 (0.618 CD):* {setup['t2']:.5f} -- close 1/3",
-            f"*TARGET 3 (point A):* {setup['t3']:.5f} -- close remainder",
-        ]
-        if confluence:
-            body += ["", f"Candlestick: {confluence['candlestick']['note']}",
-                      f"RSI: {confluence['rsi']['note']}", f"MACD: {confluence['macd']['note']}",
-                      f"ADX: {confluence['adx']['note']}"]
-        eta_line = _format_eta_line(eta)
-        if eta_line:
-            body.append(eta_line)
-        return "\n".join(body)
-
-    if action == "EXIT_PARTIAL_T1":
-        return "\n".join([
-            f"\U0001F7E1 *EXIT NOW -- Take Partial Profit (Target 1)*",
-            f"*{ticker}* -- {market} -- {tf}   *{pattern_name}* ({direction_word})",
-            "",
-            f"Target 1 ({setup['t1']:.5f}) has been reached (current price: {current_price:.5f}).",
-            f"*Action:* Close 1/3 of your position now. Move your stop loss to breakeven "
-            f"({setup['entry']:.5f}) on the remainder -- this trade can no longer be a loser.",
-            f"Remaining targets: T2 = {setup['t2']:.5f}, T3 = {setup['t3']:.5f}",
-        ])
-
-    if action == "EXIT_PARTIAL_T2":
-        return "\n".join([
-            f"\U0001F7E1 *EXIT NOW -- Take Partial Profit (Target 2)*",
-            f"*{ticker}* -- {market} -- {tf}   *{pattern_name}* ({direction_word})",
-            "",
-            f"Target 2 ({setup['t2']:.5f}) has been reached (current price: {current_price:.5f}).",
-            f"*Action:* Close another 1/3 of your position now. Stop remains at breakeven "
-            f"({setup['stop']:.5f}) on the final third.",
-            f"Final target: T3 = {setup['t3']:.5f} (point A) -- ride or trail the rest.",
-        ])
-
-    if action == "EXIT_FULL_T3":
-        return "\n".join([
-            f"\U0001F534 *EXIT NOW -- Close Full Position (Target 3 / Point A hit)*",
-            f"*{ticker}* -- {market} -- {tf}   *{pattern_name}* ({direction_word})",
-            "",
-            f"Target 3 / point A ({setup['t3']:.5f}) has been reached (current price: {current_price:.5f}).",
-            f"*Action:* Close your remaining position. Trade complete.",
-        ])
-
-    if action == "EXIT_STOP":
-        frac = setup.get('fraction_remaining', 1.0)
-        loss_note = ("Loss is capped near breakeven since T1 had already been banked."
-                     if frac < 1.0 else "This is a full stop-out -- the pattern failed.")
-        return "\n".join([
-            f"\U0001F534 *EXIT NOW -- Stop Loss Hit*",
-            f"*{ticker}* -- {market} -- {tf}   *{pattern_name}* ({direction_word})",
-            "",
-            f"Stop ({setup['stop']:.5f}) has been hit (current price: {current_price:.5f}).",
-            f"*Action:* Close the remaining position immediately if your broker/platform hasn't "
-            f"already stopped you out. {loss_note}",
-        ])
-
-    if action == "EXIT_TRAILING_STOP":
-        return "\n".join([
-            f"\U0001F534 *EXIT NOW -- Trailing Stop Hit*",
-            f"*{ticker}* -- {market} -- {tf}   *{pattern_name}* ({direction_word})",
-            "",
-            f"After Target 2, the stop was trailing behind price instead of waiting for a fixed "
-            f"Target 3 -- it just got hit at {setup['stop']:.5f} (current price: {current_price:.5f}).",
-            f"*Action:* Close the remaining position. This let the trade run further than the "
-            f"original Target 3 before locking in -- check the trade log to see how far it extended.",
-        ])
-
-    if action == "SETUP_INVALIDATED":
-        return "\n".join([
-            f"\u26AA *Setup invalidated -- no trade*",
-            f"*{ticker}* -- {market} -- {tf}   *{pattern_name}* ({direction_word})",
-            "",
-            f"Price traded through point X before a confirmation candle appeared. "
-            f"This pattern is no longer valid -- do not enter.",
-        ])
-
-    return ""
-
-
-def format_enter_now_caption(setup: dict, current_price: float, confluence: dict = None) -> str:
-    """Short caption to go with the chart photo -- the full detailed
-    reasoning still goes out as a separate text message via
-    format_action_alert, this is just what fits under the image."""
-    ticker, market, tf = setup["ticker"], setup["market"], setup["timeframe"]
-    pattern_name, direction = setup["pattern"], setup["direction"]
-    direction_word = "LONG" if direction == "bullish" else "SHORT"
-    lines = [
-        f"\U0001F7E2\U0001F7E2 ENTER NOW -- {direction_word} {ticker}",
-        f"{pattern_name} | {market} | {tf}",
-        f"Entry {setup['entry']:.5f} | Stop {setup['stop']:.5f}",
-        f"T1 {setup['t1']:.5f} | T2 {setup['t2']:.5f} | T3 {setup['t3']:.5f}",
-    ]
-    if confluence:
-        q = confluence.get("adjusted_score", confluence.get("base_quality_score"))
-        if q is not None:
-            lines.append(f"Confluence score: {q}/100")
-    return "\n".join(lines)
+def fmt_event(pos: dict, ev: dict) -> str:
+    h = f"{pos['ticker']} {_side(pos)} {pos['pattern']}"
+    t, px = ev["type"], _fmt(ev["price"])
+    msgs = {
+        "ENTERED": f"ENTRY MODELLED: {h}\nFilled at the {ev['bar'][:10]} open: {px}. Stop {_fmt(pos['stop'])}. "
+                   f"If you could not get near this price, skip the trade.",
+        "T1": f"TAKE PROFIT 1: {h}\nT1 hit ({px}). Close 1/3 now. Move stop to breakeven {_fmt(pos['entry'])}.",
+        "T2": f"TAKE PROFIT 2: {h}\nT2 hit ({px}). Close another 1/3. Stop now {_fmt(pos['stop'])}.",
+        "T3": f"EXIT ALL: {h}\nT3 hit ({px}). Close the remainder. Trade complete.",
+        "STOP": f"STOPPED OUT: {h}\nStop hit, fill {px}. Close any remaining position. Result {pos['r_multiple']:+.2f}R.",
+        "BE_STOP": f"EXIT (breakeven stop): {h}\nStopped at {px} after banking partial profit. Result {pos['r_multiple']:+.2f}R.",
+        "TRAIL_STOP": f"EXIT (trailing stop): {h}\nTrailing stop hit at {px}. Result {pos['r_multiple']:+.2f}R.",
+        "TIME_STOP": f"EXIT (time stop): {h}\nHeld {config.MAX_HOLD_BARS} bars without resolving; closing at {px}. Result {pos['r_multiple']:+.2f}R.",
+        "INVALIDATED": f"CANCELLED: {h}\n{ev['note']}",
+    }
+    return msgs.get(t, f"{t}: {h} @ {px}")

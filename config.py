@@ -105,3 +105,52 @@ EARNINGS_BLACKOUT_HOURS_AFTER = 24
 
 # --- How often the scanner runs (minutes) when deployed with cron/systemd ---
 SCAN_INTERVAL_MINUTES = 60
+
+
+# ===========================================================================
+# v2 additions -- these drive the shared engine used by BOTH scanner and backtest
+# ===========================================================================
+# A signal is only "fresh" if its trigger (D confirmed AND confirmation candle)
+# happened within this many CLOSED bars of the latest closed bar. Anything older
+# is history, not a trade.
+FRESH_BARS = 2
+
+# Skip the trade if reward to T2 divided by risk (measured from the REAL entry
+# price, not D) is below this. Also used as the "don't chase" price limit.
+MIN_RR_T2 = 1.0
+
+# Stop distance sanity (percent of price). Too tight = costs eat the R; too
+# wide = the pattern isn't giving you a defined-risk trade.
+MIN_STOP_PCT = 0.4
+MAX_STOP_PCT = 12.0
+
+# Require RSI/MACD divergence (vs B) in addition to the confirmation candle.
+REQUIRE_MOMENTUM = True
+
+# Close any trade still open after this many bars (kills "zombie" trades that
+# otherwise sit OPEN forever and block the concurrent-trade cap).
+MAX_HOLD_BARS = 40
+
+# Round-trip cost as % of price (spread + slippage + commission). BE HONEST here;
+# every backtest number depends on it. Starting guesses, not facts.
+COST_PCT = {"AUS": 0.20, "US": 0.08, "INDIA": 0.20, "FOREX": 0.03}
+
+# Same-direction limit for tickers with no entry in correlation.TICKER_BUCKETS
+# (they previously each got their own bucket, i.e. no cap at all).
+MAX_SAME_DIR_PER_MARKET = 3
+
+# Where the dashboard reads live state from. Set STATE_URL (raw GitHub URL) so the
+# dashboard doesn't depend on a redeploy to see fresh state.
+STATE_URL = os.environ.get("STATE_URL", "")
+GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "")
+
+# Extra slippage applied to the assumed next-open fill (% of price), on top of COST_PCT.
+ENTRY_SLIPPAGE_PCT = 0.0
+
+# Treat the running extreme since point C as a candidate D (earlier, repaint-prone but
+# evaluated identically in backtest and live). Turn off to trade confirmed pivots only.
+USE_TENTATIVE_D = True
+
+# Send a one-line "scan ok" message per run. A MISSING summary is your dead-man's switch:
+# if you stop receiving them, the scheduler/data feed is down.
+SEND_SUMMARY = True

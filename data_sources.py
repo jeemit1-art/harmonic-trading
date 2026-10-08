@@ -1,302 +1,197 @@
 """
-Data fetching layer. Uses yfinance (free) as the default source across all
-four markets. Swap in a broker feed later by writing another class with the
-same `.fetch(ticker, interval, period)` interface -- nothing else in the
-system needs to change.
+Data layer. Fixes vs v1:
+  * yfinance has NO '4h' interval -- v1 asked for it, so every FOREX scan failed.
+    4h bars are now built by resampling 1h.
+  * Only CLOSED bars are returned. v1 happily analysed the still-forming last
+    bar, so a hammer/engulfing candle could appear mid-session and vanish by close.
+  * Batched downloads (one request per ~40 tickers) instead of ~2,400 sequential
+    ones per run, which was slow enough that data was stale before the scan ended.
+  * auto_adjust=False: levels match the prices you actually see and trade
+    (splits adjusted, dividends not).
+  * Tickers that keep returning nothing (delisted/renamed) are skipped for a week
+    instead of burning three retries every run.
 """
+import json, os, time
+from datetime import datetime, timezone, timedelta
+from zoneinfo import ZoneInfo
+
 import pandas as pd
-import time
 
 try:
     import yfinance as yf
-except ImportError:
+except ImportError:  # pragma: no cover
     yf = None
+
+MARKET_TZ = {"AUS": "Australia/Sydney", "US": "America/New_York", "INDIA": "Asia/Kolkata", "FOREX": "UTC"}
+# local time after which a DAILY bar is final (a little after the close, so closing auctions are included)
+MARKET_DAILY_FINAL = {"AUS": (16, 30), "US": (16, 15), "INDIA": (15, 50), "FOREX": (0, 0)}
+INTERVAL_DELTA = {"1m": "1min", "5m": "5min", "15m": "15min", "30m": "30min", "1h": "1h", "60m": "1h", "4h": "4h", "1d": "1D"}
+HEALTH_FILE = os.environ.get("HEALTH_FILE", os.path.join(os.path.dirname(os.path.abspath(__file__)), "data_health.json"))
+DEAD_AFTER, DEAD_FOR_DAYS, CHUNK = 3, 7, 40
+
+
+# ----------------------------------------------------------------------------- pure helpers (unit-tested)
+def resample_4h(df1h: pd.DataFrame) -> pd.DataFrame:
+    d = df1h.copy()
+    d.index = d.index.tz_localize("UTC") if d.index.tz is None else d.index.tz_convert("UTC")
+    agg = {"Open": "first", "High": "max", "Low": "min", "Close": "last", "Volume": "sum"}
+    out = d.resample("4h", origin="start_day").agg(agg)
+    return out.dropna(subset=["Open", "High", "Low", "Close"])
+
+
+def drop_incomplete(df: pd.DataFrame, interval: str, market: str = "US", now: datetime = None) -> pd.DataFrame:
+    """Keep only bars that have fully closed as of `now`."""
+    if df.empty:
+        return df
+    now = now or datetime.now(timezone.utc)
+    if interval == "1d":
+        tz = ZoneInfo(MARKET_TZ.get(market, "UTC"))
+        local = now.astimezone(tz)
+        h, m = MARKET_DAILY_FINAL.get(market, (0, 0))
+        idx_dates = pd.DatetimeIndex(df.index).tz_localize(None).normalize() if df.index.tz is None \
+            else pd.DatetimeIndex(df.index).tz_convert(tz).tz_localize(None).normalize()
+        today = pd.Timestamp(local.date())
+        final_today = (local.hour, local.minute) >= (h, m)
+        keep = (idx_dates < today) | ((idx_dates == today) & final_today)
+        if market == "FOREX":
+            keep = idx_dates < today
+        return df[keep]
+    delta = pd.Timedelta(INTERVAL_DELTA.get(interval, "1h"))
+    idx = df.index if df.index.tz is not None else df.index.tz_localize("UTC")
+    return df[(idx + delta) <= pd.Timestamp(now)]
+
+
+# ----------------------------------------------------------------------------- health file
+def _load_health() -> dict:
+    try:
+        with open(HEALTH_FILE) as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def _save_health(h: dict):
+    try:
+        with open(HEALTH_FILE, "w") as f:
+            json.dump(h, f)
+    except Exception:
+        pass
+
+
+def is_dead(h: dict, ticker: str) -> bool:
+    r = h.get(ticker)
+    if not r or r.get("fails", 0) < DEAD_AFTER:
+        return False
+    return datetime.fromisoformat(r["last"]) > datetime.now(timezone.utc) - timedelta(days=DEAD_FOR_DAYS)
+
+
+# ----------------------------------------------------------------------------- download
+def _extract(raw: pd.DataFrame, ticker: str, single: bool):
+    if raw is None or raw.empty:
+        return None
+    if isinstance(raw.columns, pd.MultiIndex):
+        l0, l1 = raw.columns.get_level_values(0), raw.columns.get_level_values(1)
+        if ticker in l0:
+            sub = raw[ticker]
+        elif ticker in l1:
+            sub = raw.xs(ticker, axis=1, level=1)
+        else:
+            return None
+    else:
+        sub = raw if single else None
+    if sub is None:
+        return None
+    cols = [c for c in ("Open", "High", "Low", "Close", "Volume") if c in sub.columns]
+    if len(cols) < 5:
+        return None
+    sub = sub[cols].dropna(subset=["Open", "High", "Low", "Close"])
+    return sub if len(sub) else None
+
+
+def _yf_params(interval: str, period: str):
+    if interval == "4h":
+        return "1h", period
+    return interval, period
 
 
 class YFinanceSource:
-    """
-    Ticker suffix cheat-sheet (yfinance / Yahoo Finance convention):
-        AUS (ASX)  -> 'BHP.AX', 'CBA.AX', 'CSL.AX' ...
-        US         -> 'AAPL', 'MSFT', 'SPY' ...
-        India      -> 'RELIANCE.NS', 'TCS.NS', 'INFY.NS' (NSE) or '.BO' for BSE
-        Forex      -> 'AUDUSD=X', 'EURUSD=X', 'USDJPY=X', 'GBPUSD=X' ...
-    """
     name = "yfinance"
 
-    def fetch(self, ticker: str, interval: str = "1h", period: str = "60d",
-              retries: int = 3) -> pd.DataFrame:
+    def fetch_many(self, tickers: list[str], interval: str, period: str, market: str = "US",
+                   retries: int = 3) -> dict[str, pd.DataFrame]:
         if yf is None:
-            raise RuntimeError("yfinance not installed. Run: pip install yfinance")
+            raise RuntimeError("yfinance not installed")
+        health = _load_health()
+        wanted = [t for t in tickers if not is_dead(health, t)]
+        yf_int, yf_period = _yf_params(interval, period)
+        out: dict[str, pd.DataFrame] = {}
+        for i in range(0, len(wanted), CHUNK):
+            chunk = wanted[i:i + CHUNK]
+            raw = None
+            for attempt in range(retries):
+                try:
+                    raw = yf.download(chunk, interval=yf_int, period=yf_period, group_by="ticker", auto_adjust=False,
+                                      threads=True, progress=False)
+                    if raw is not None and not raw.empty:
+                        break
+                except Exception:
+                    pass
+                time.sleep(2 * (attempt + 1))
+            for t in chunk:
+                df = _extract(raw, t, single=len(chunk) == 1)
+                if df is None:
+                    r = health.get(t, {"fails": 0})
+                    health[t] = {"fails": r["fails"] + 1, "last": datetime.now(timezone.utc).isoformat()}
+                    continue
+                if interval == "4h":
+                    df = resample_4h(df)
+                df = drop_incomplete(df, interval, market)
+                if len(df):
+                    out[t] = df
+                    health.pop(t, None)
+        _save_health(health)
+        return out
 
-        # yfinance limits how far back intraday intervals go; clamp sensibly
-        intraday_caps = {"1m": "7d", "5m": "60d", "15m": "60d", "30m": "60d",
-                          "1h": "730d", "60m": "730d"}
-        if interval in intraday_caps:
-            max_period = intraday_caps[interval]
-            period = max_period if period == "max" else period
+    def fetch(self, ticker: str, interval: str = "1d", period: str = "1y", market: str = None,
+              retries: int = 3) -> pd.DataFrame:
+        market = market or _guess_market(ticker)
+        res = self.fetch_many([ticker], interval, period, market, retries)
+        if ticker not in res:
+            raise RuntimeError(f"No data for {ticker} ({interval}/{period})")
+        return res[ticker]
 
-        last_err = None
-        for attempt in range(retries):
-            try:
-                df = yf.download(ticker, interval=interval, period=period,
-                                  progress=False, auto_adjust=True)
-                if df is None or df.empty:
-                    raise ValueError(f"No data returned for {ticker}")
-                if isinstance(df.columns, pd.MultiIndex):
-                    df.columns = df.columns.get_level_values(0)
-                df = df[["Open", "High", "Low", "Close", "Volume"]].dropna()
-                return df
-            except Exception as e:
-                last_err = e
-                time.sleep(1.5 * (attempt + 1))
-        raise RuntimeError(f"Failed to fetch {ticker} after {retries} attempts: {last_err}")
+
+def _guess_market(t: str) -> str:
+    if t.endswith(".AX"): return "AUS"
+    if t.endswith(".NS") or t.endswith(".BO"): return "INDIA"
+    if t.endswith("=X"): return "FOREX"
+    return "US"
 
 
 DEFAULT_SOURCE = YFinanceSource()
 
-
-# --------------------------------------------------------------------------
-# Watchlists -- edit freely. Kept small & liquid by default; liquid names
-# form cleaner, more reliable harmonic structures than thin/illiquid ones.
-# --------------------------------------------------------------------------
-
+# ----------------------------------------------------------------------------- watchlists
+# CURATED for liquidity: harmonic structure on thin stocks is mostly noise, and v1's ~1,200-ticker
+# lists (several years stale, many delisted/renamed) made each run slow and rate-limited.
+# Verify tickers on Yahoo before relying on them -- I could not check them live.
 WATCHLISTS = {
-    # ~180 ASX-listed companies, cleaned from the S&P/ASX 200 constituent
-    # list -- ETF/fund tickers removed (not individual companies), and
-    # several since-delisted/merged names removed (Afterpay, Newcrest,
-    # OZ Minerals, Sydney Airport, Crown Resorts, Allkem) or corrected
-    # (Woodside Petroleum WPL -> Woodside Energy WDS after its 2022
-    # merger). Source list dated Jan 2022; if any individual ticker below
-    # has since delisted or changed symbol, the scanner logs and skips it
-    # gracefully -- it won't break the rest of the scan.
-    "AUS": [
-        "ABP.AX","AGL.AX","ALQ.AX","ALU.AX","AWC.AX","AMC.AX","AMP.AX","ALD.AX",
-        "ANN.AX","APA.AX","APM.AX","ARB.AX","ARG.AX","ALL.AX","ASX.AX","ALX.AX",
-        "AIA.AX","AZJ.AX","ANZ.AX","AFI.AX","BOQ.AX","BAP.AX","BPT.AX","BEN.AX",
-        "BHP.AX","BSL.AX","BLD.AX","BXB.AX","BRG.AX","BKW.AX","BWP.AX","CAR.AX",
-        "CNI.AX","CIP.AX","CHN.AX","CGF.AX","CIA.AX","CHC.AX","CLW.AX","CQR.AX",
-        "CNU.AX","CIM.AX","CWY.AX","COH.AX","COL.AX","CBA.AX","CPU.AX","CRN.AX",
-        "CTD.AX","CCP.AX","CMW.AX","CSL.AX","CSR.AX","DRR.AX","DXS.AX","DDR.AX",
-        "DHG.AX","DMP.AX","DOW.AX","APE.AX","EBO.AX","EDV.AX","EVT.AX","EVN.AX",
-        "FPH.AX","FBU.AX","FLT.AX","FMG.AX","GNE.AX","GMG.AX","GPT.AX","GQG.AX",
-        "GOZ.AX","HVN.AX","HLS.AX","HMC.AX","IEL.AX","IGO.AX","ILU.AX","IMU.AX",
-        "IPL.AX","IFT.AX","INA.AX","IFL.AX","IAG.AX","IRE.AX","JHX.AX","JBH.AX",
-        "JLG.AX","JDO.AX","LFS.AX","LLC.AX","LNK.AX","LTR.AX","LYC.AX","MQG.AX",
-        "MFG.AX","MPL.AX","MP1.AX","MCY.AX","MEZ.AX","MTS.AX","MIN.AX","MGR.AX",
-        "NAB.AX","NSR.AX","NWL.AX","NXT.AX","NHF.AX","NIC.AX","NEC.AX","NST.AX",
-        "NVX.AX","ORI.AX","ORG.AX","ORA.AX","PDN.AX","PDL.AX","PXA.AX","PLS.AX",
-        "PNI.AX","PMV.AX","PME.AX","QAN.AX","QBE.AX","QUB.AX","RHC.AX","REA.AX",
-        "REH.AX","RWC.AX","RMD.AX","RIO.AX","SFR.AX","STO.AX","SCG.AX","SEK.AX",
-        "SVW.AX","SCP.AX","SGM.AX","SKC.AX","SHL.AX","S32.AX","SPK.AX","SDF.AX",
-        "SGP.AX","SNZ.AX","SUN.AX","SUL.AX","TAH.AX","TNE.AX","TLX.AX","TLS.AX",
-        "A2M.AX","SGR.AX","TPG.AX","TCL.AX","TWE.AX","UWL.AX","VCX.AX","VUK.AX",
-        "VEA.AX","SOL.AX","WES.AX","WBC.AX","WHC.AX","WTC.AX","WDS.AX","WOW.AX",
-        "WOR.AX","XRO.AX","YAL.AX","ZIM.AX","Z1P.AX",
-    ],
-
-    # Full S&P 500 constituent list (503 tickers incl. dual share classes),
-    # sourced from Wikipedia's "List of S&P 500 companies" (current as of
-    # this build). Note BRK.B/BF.B use yfinance's hyphen convention
-    # (BRK-B, BF-B), not the period used in official ticker notation.
-    "US": [
-        "MMM","AOS","ABT","ABBV","ACN","ADBE","AMD","AES","AFL","A","APD","ABNB",
-        "AKAM","ALB","ARE","ALGN","ALLE","LNT","ALL","GOOGL","GOOG","MO","AMZN",
-        "AMCR","AEE","AEP","AXP","AIG","AMT","AWK","AMP","AME","AMGN","APH","ADI",
-        "AON","APA","APO","AAPL","AMAT","APP","APTV","ACGL","ADM","ARES","ANET",
-        "AJG","AIZ","T","ATO","ADSK","ADP","AZO","AVB","AVY","AXON","BKR","BALL",
-        "BAC","BAX","BDX","BRK-B","BBY","TECH","BIIB","BLK","BX","XYZ","BNY","BA",
-        "BKNG","BSX","BMY","AVGO","BR","BRO","BF-B","BLDR","BG","BXP","CHRW","CDNS",
-        "CPT","CPB","COF","CAH","CCL","CARR","CVNA","CASY","CAT","CBOE","CBRE",
-        "CDW","COR","CNC","CNP","CF","CRL","SCHW","CHTR","CVX","CMG","CB","CHD",
-        "CIEN","CI","CINF","CTAS","CSCO","C","CFG","CLX","CME","CMS","KO","CTSH",
-        "COHR","COIN","CL","CMCSA","FIX","CAG","COP","ED","STZ","CEG","COO","CPRT",
-        "GLW","CPAY","CTVA","CSGP","COST","CRH","CRWD","CCI","CSX","CMI","CVS",
-        "DHR","DRI","DDOG","DVA","DECK","DE","DELL","DAL","DVN","DXCM","FANG","DLR",
-        "DG","DLTR","D","DPZ","DASH","DOV","DOW","DHI","DTE","DUK","DD","ETN",
-        "EBAY","SATS","ECL","EIX","EW","EA","ELV","EME","EMR","ETR","EOG","EPAM",
-        "EQT","EFX","EQIX","EQR","ERIE","ESS","EL","EG","EVRG","ES","EXC","EXE",
-        "EXPE","EXPD","EXR","XOM","FFIV","FDS","FICO","FAST","FRT","FDX","FIS",
-        "FITB","FSLR","FE","FISV","F","FTNT","FTV","FOXA","FOX","BEN","FCX","GRMN",
-        "IT","GE","GEHC","GEV","GEN","GNRC","GD","GIS","GM","GPC","GILD","GPN",
-        "GL","GDDY","GS","HAL","HIG","HAS","HCA","DOC","HSIC","HSY","HPE","HLT",
-        "HD","HON","HRL","HST","HWM","HPQ","HUBB","HUM","HBAN","HII","IBM","IEX",
-        "IDXX","ITW","INCY","IR","PODD","INTC","IBKR","ICE","IFF","IP","INTU",
-        "ISRG","IVZ","INVH","IQV","IRM","JBHT","JBL","JKHY","J","JNJ","JCI","JPM",
-        "KVUE","KDP","KEY","KEYS","KMB","KIM","KMI","KKR","KLAC","KHC","KR","LHX",
-        "LH","LRCX","LVS","LDOS","LEN","LII","LLY","LIN","LYV","LMT","L","LOW",
-        "LULU","LITE","LYB","MTB","MPC","MAR","MMC","MLM","MAS","MA","MKC","MCD",
-        "MCK","MDT","MRK","META","MET","MTD","MGM","MCHP","MU","MSFT","MAA","MRNA",
-        "TAP","MDLZ","MPWR","MNST","MCO","MS","MOS","MSI","MSCI","NDAQ","NTAP",
-        "NFLX","NEM","NWSA","NWS","NEE","NKE","NI","NDSN","NSC","NTRS","NOC","NCLH",
-        "NRG","NUE","NVDA","NVR","NXPI","ORLY","OXY","ODFL","OMC","ON","OKE","ORCL",
-        "OTIS","PCAR","PKG","PLTR","PANW","PSKY","PH","PAYX","PYPL","PNR","PEP",
-        "PFE","PCG","PM","PSX","PNW","PNC","POOL","PPG","PPL","PFG","PG","PGR",
-        "PLD","PRU","PEG","PTC","PSA","PHM","PWR","QCOM","DGX","RL","RJF","RTX",
-        "O","REG","REGN","RF","RSG","RMD","RVTY","HOOD","ROK","ROL","ROP","ROST",
-        "RCL","SPGI","CRM","SNDK","SBAC","SLB","STX","SRE","NOW","SHW","SPG","SWKS",
-        "SJM","SW","SNA","SOLV","SO","LUV","SWK","SBUX","STT","STLD","STE","SYK",
-        "SMCI","SYF","SNPS","SYY","TMUS","TROW","TTWO","TPR","TRGP","TGT","TEL",
-        "TDY","TER","TSLA","TXN","TPL","TXT","TMO","TJX","TKO","TTD","TSCO","TT",
-        "TDG","TRV","TRMB","TFC","TYL","TSN","USB","UBER","UDR","ULTA","UNP","UAL",
-        "UPS","URI","UNH","UHS","VLO","VEEV","VTR","VLTO","VRSN","VRSK","VZ","VRTX",
-        "VRT","VTRS","VICI","V","VST","VMC","WRB","GWW","WAB","WMT","DIS","WBD",
-        "WM","WAT","WEC","WFC","WELL","WST","WDC","WY","WSM","WMB","WTW","WDAY",
-        "WYNN","XEL","XYL","YUM","ZBRA","ZBH","ZTS",
-    ],
-
-    # Nifty 500 constituent list, sourced from a public NSE-tracking CSV
-    # (github.com/kprohith/nse-stock-analysis). I cross-checked it against
-    # known corporate actions and removed 10 entries confirmed stale --
-    # PSU banks merged in the 2019-2020 mega-merger (Allahabad Bank, Andhra
-    # Bank, Corporation Bank, Oriental Bank of Commerce, Syndicate Bank all
-    # absorbed into other banks) plus companies that went through insolvency
-    # around the same period (DHFL, Jet Airways, Reliance Capital, Reliance
-    # Communications) and Adani Transmission (renamed Adani Energy Solutions).
-    # TATAMOTORS corrected to TMPV per the earlier fix. As always, if any
-    # remaining ticker has since delisted or changed symbol, the scanner logs
-    # it and skips to the next one rather than breaking the whole run.
-    "INDIA": [
-        "3MINDIA.NS", "ABB.NS", "ACC.NS", "AIAENG.NS",
-        "APLAPOLLO.NS", "AUBANK.NS", "AAVAS.NS", "ADANIGREEN.NS",
-        "ADANIPORTS.NS", "ADANIPOWER.NS", "ABCAPITAL.NS", "ABFRL.NS",
-        "ADVENZYMES.NS", "AEGISCHEM.NS", "AJANTPHARM.NS", "AKZOINDIA.NS",
-        "APLLTD.NS", "ALKEM.NS", "ALLCARGO.NS", "AMARAJABAT.NS",
-        "AMBUJACEM.NS", "APOLLOHOSP.NS", "APOLLOTYRE.NS", "ASHOKLEY.NS",
-        "ASHOKA.NS", "ASIANPAINT.NS", "ASTERDM.NS", "ASTRAZEN.NS",
-        "ASTRAL.NS", "ATUL.NS", "AUROPHARMA.NS", "AVANTIFEED.NS",
-        "DMART.NS", "AXISBANK.NS", "BASF.NS", "BEML.NS",
-        "BSE.NS", "BAJAJ-AUTO.NS", "BAJAJCON.NS", "BAJAJELEC.NS",
-        "BAJFINANCE.NS", "BAJAJFINSV.NS", "BAJAJHLDNG.NS", "BALKRISIND.NS",
-        "BALMLAWRIE.NS", "BALRAMCHIN.NS", "BANDHANBNK.NS", "BANKBARODA.NS",
-        "BANKINDIA.NS", "MAHABANK.NS", "BATAINDIA.NS", "BERGEPAINT.NS",
-        "BDL.NS", "BEL.NS", "BHARATFORG.NS", "BHEL.NS",
-        "BPCL.NS", "BHARTIARTL.NS", "INFRATEL.NS", "BIOCON.NS",
-        "BIRLACORPN.NS", "BLISSGVS.NS", "BLUEDART.NS", "BLUESTARCO.NS",
-        "BBTC.NS", "BOMDYEING.NS", "BOSCHLTD.NS", "BRIGADE.NS",
-        "BRITANNIA.NS", "CARERATING.NS", "CCL.NS", "CESC.NS",
-        "CGPOWER.NS", "CRISIL.NS", "CADILAHC.NS", "CANFINHOME.NS",
-        "CANBK.NS", "CAPLIPOINT.NS", "CARBORUNIV.NS", "CASTROLIND.NS",
-        "CEATLTD.NS", "CENTRALBK.NS", "CDSL.NS", "CENTURYPLY.NS",
-        "CERA.NS", "CHAMBLFERT.NS", "CHENNPETRO.NS", "CHOLAHLDNG.NS",
-        "CHOLAFIN.NS", "CIPLA.NS", "CUB.NS", "COALINDIA.NS",
-        "COCHINSHIP.NS", "COFFEEDAY.NS", "COLPAL.NS", "CONCOR.NS",
-        "COROMANDEL.NS", "COX&KINGS.NS", "CREDITACC.NS", "CROMPTON.NS",
-        "CUMMINSIND.NS", "CYIENT.NS", "DBCORP.NS", "DCBBANK.NS",
-        "DCMSHRIRAM.NS", "DLF.NS", "DABUR.NS", "DEEPAKFERT.NS",
-        "DEEPAKNTR.NS", "DELTACORP.NS", "DBL.NS", "DISHTV.NS",
-        "DCAL.NS", "DIVISLAB.NS", "DIXON.NS", "LALPATHLAB.NS",
-        "DRREDDY.NS", "EIDPARRY.NS", "EIHOTEL.NS", "EDELWEISS.NS",
-        "EICHERMOT.NS", "ELGIEQUIP.NS", "EMAMILTD.NS", "ENDURANCE.NS",
-        "ENGINERSIN.NS", "EQUITAS.NS", "ERIS.NS", "ESCORTS.NS",
-        "ESSELPACK.NS", "EXIDEIND.NS", "FDC.NS", "FEDERALBNK.NS",
-        "FINEORG.NS", "FINCABLES.NS", "FINPIPE.NS", "FSL.NS",
-        "FORTIS.NS", "FCONSUMER.NS", "FLFL.NS", "FRETAIL.NS",
-        "GAIL.NS", "GEPIL.NS", "GET&D.NS", "GHCL.NS",
-        "GMRINFRA.NS", "GALAXYSURF.NS", "GDL.NS", "GAYAPROJ.NS",
-        "GICRE.NS", "GILLETTE.NS", "GSKCONS.NS", "GLAXO.NS",
-        "GLENMARK.NS", "GODFRYPHLP.NS", "GODREJAGRO.NS", "GODREJCP.NS",
-        "GODREJIND.NS", "GODREJPROP.NS", "GRANULES.NS", "GRAPHITE.NS",
-        "GRASIM.NS", "GESHIP.NS", "GREAVESCOT.NS", "GRINDWELL.NS",
-        "GRUH.NS", "GUJALKALI.NS", "GUJFLUORO.NS", "GUJGASLTD.NS",
-        "GMDCLTD.NS", "GNFC.NS", "GPPL.NS", "GSFC.NS",
-        "GSPL.NS", "GULFOILLUB.NS", "HEG.NS", "HCLTECH.NS",
-        "HDFCAMC.NS", "HDFCBANK.NS", "HDFCLIFE.NS", "HATHWAY.NS",
-        "HATSUN.NS", "HAVELLS.NS", "HEIDELBERG.NS", "HERITGFOOD.NS",
-        "HEROMOTOCO.NS", "HEXAWARE.NS", "HFCL.NS", "HSCL.NS",
-        "HIMATSEIDE.NS", "HINDALCO.NS", "HAL.NS", "HINDCOPPER.NS",
-        "HINDPETRO.NS", "HINDUNILVR.NS", "HINDZINC.NS", "HONAUT.NS",
-        "HUDCO.NS", "HDFC.NS", "ICICIBANK.NS", "ICICIGI.NS",
-        "ICICIPRULI.NS", "ISEC.NS", "ICRA.NS", "IDBI.NS",
-        "IDFCFIRSTB.NS", "IDFC.NS", "IFBIND.NS", "IFCI.NS",
-        "IRB.NS", "IRCON.NS", "ITC.NS", "ITDCEM.NS",
-        "ITI.NS", "INDIACEM.NS", "ITDC.NS", "IBULHSGFIN.NS",
-        "IBULISL.NS", "IBREALEST.NS", "IBVENTURES.NS", "INDIANB.NS",
-        "IEX.NS", "INDHOTEL.NS", "IOC.NS", "IOB.NS",
-        "INDOSTAR.NS", "INDOCO.NS", "IGL.NS", "INDUSINDBK.NS",
-        "INFIBEAM.NS", "NAUKRI.NS", "INFY.NS", "INOXLEISUR.NS",
-        "INOXWIND.NS", "INTELLECT.NS", "INDIGO.NS", "IPCALAB.NS",
-        "JBCHEPHARM.NS", "JKCEMENT.NS", "JKLAKSHMI.NS", "JKPAPER.NS",
-        "JKTYRE.NS", "JMFINANCIL.NS", "JSWENERGY.NS", "JSWSTEEL.NS",
-        "JAGRAN.NS", "JAICORPLTD.NS", "JISLJALEQS.NS", "JPASSOCIAT.NS",
-        "J&KBANK.NS", "JAMNAAUTO.NS", "JINDALSAW.NS", "JSLHISAR.NS",
-        "JSL.NS", "JINDALSTEL.NS", "JUBLFOOD.NS", "JUBILANT.NS",
-        "JUSTDIAL.NS", "JYOTHYLAB.NS", "KPRMILL.NS", "KEI.NS",
-        "KIOCL.NS", "KNRCON.NS", "KRBL.NS", "KAJARIACER.NS",
-        "KALPATPOWR.NS", "KANSAINER.NS", "KTKBANK.NS", "KARURVYSYA.NS",
-        "KSCL.NS", "KEC.NS", "KIRLOSENG.NS", "KOLTEPATIL.NS",
-        "KOTAKBANK.NS", "L&TFH.NS", "LTTS.NS", "LICHSGFIN.NS",
-        "LAXMIMACH.NS", "LAKSHVILAS.NS", "LTI.NS", "LT.NS",
-        "LAURUSLABS.NS", "LEMONTREE.NS", "LINDEINDIA.NS", "LUPIN.NS",
-        "LUXIND.NS", "MASFIN.NS", "MMTC.NS", "MOIL.NS",
-        "MRF.NS", "MAGMA.NS", "MGL.NS", "MAHSCOOTER.NS",
-        "MAHSEAMLES.NS", "M&MFIN.NS", "M&M.NS", "MAHINDCIE.NS",
-        "MHRIL.NS", "MAHLOG.NS", "MANAPPURAM.NS", "MRPL.NS",
-        "MARICO.NS", "MARUTI.NS", "MFSL.NS", "MAXINDIA.NS",
-        "MINDTREE.NS", "MINDACORP.NS", "MINDAIND.NS", "MONSANTO.NS",
-        "MOTHERSUMI.NS", "MOTILALOFS.NS", "MPHASIS.NS", "MUTHOOTFIN.NS",
-        "NATCOPHARM.NS", "NBCC.NS", "NCC.NS", "NESCO.NS",
-        "NHPC.NS", "NIITTECH.NS", "NLCINDIA.NS", "NMDC.NS",
-        "NTPC.NS", "NH.NS", "NATIONALUM.NS", "NFL.NS",
-        "NBVENTURES.NS", "NAVINFLUOR.NS", "NETWORK18.NS", "NILKAMAL.NS",
-        "OBEROIRLTY.NS", "ONGC.NS", "OIL.NS", "OMAXE.NS",
-        "OFSS.NS", "ORIENTCEM.NS", "ORIENTELEC.NS", "PCJEWELLER.NS",
-        "PIIND.NS", "PNBHOUSING.NS", "PNCINFRA.NS", "PTC.NS",
-        "PVR.NS", "PAGEIND.NS", "PARAGMILK.NS", "PERSISTENT.NS",
-        "PETRONET.NS", "PFIZER.NS", "PHILIPCARB.NS", "PHOENIXLTD.NS",
-        "PIDILITIND.NS", "PEL.NS", "PFC.NS", "POWERGRID.NS",
-        "PRAJIND.NS", "PRESTIGE.NS", "PRSMJOHNSN.NS", "PGHL.NS",
-        "PGHH.NS", "PNB.NS", "QUESS.NS", "RBLBANK.NS",
-        "RECLTD.NS", "RITES.NS", "RADICO.NS", "RAIN.NS",
-        "RAJESHEXPO.NS", "RALLIS.NS", "RKFORGE.NS", "RCF.NS",
-        "RAYMOND.NS", "REDINGTON.NS", "RELAXO.NS", "RHFL.NS",
-        "RELIANCE.NS", "RELINFRA.NS", "RNAM.NS", "RPOWER.NS",
-        "REPCOHOME.NS", "RUPA.NS", "SHK.NS", "SBILIFE.NS",
-        "SJVN.NS", "SKFINDIA.NS", "SREINFRA.NS", "SRF.NS",
-        "SADBHAV.NS", "SANOFI.NS", "SCHAEFFLER.NS", "SIS.NS",
-        "SHANKARA.NS", "SHARDACROP.NS", "SFL.NS", "SHILPAMED.NS",
-        "SCI.NS", "SHOPERSTOP.NS", "SHREECEM.NS", "RENUKA.NS",
-        "SHRIRAMCIT.NS", "SRTRANSFIN.NS", "SIEMENS.NS", "SPTL.NS",
-        "SOBHA.NS", "SOLARINDS.NS", "SONATSOFTW.NS", "SOUTHBANK.NS",
-        "STARCEMENT.NS", "SBIN.NS", "SAIL.NS", "STRTECH.NS",
-        "STAR.NS", "SUDARSCHEM.NS", "SPARC.NS", "SUNPHARMA.NS",
-        "SUNTV.NS", "SUNCLAYLTD.NS", "SUNDARMFIN.NS", "SUNDRMFAST.NS",
-        "SUNTECK.NS", "SUPRAJIT.NS", "SUPREMEIND.NS", "SUVEN.NS",
-        "SUZLON.NS", "SWANENERGY.NS", "SYMPHONY.NS", "SYNGENE.NS",
-        "TCNSBRANDS.NS", "TTKPRESTIG.NS", "TVTODAY.NS", "TV18BRDCST.NS",
-        "TVSMOTOR.NS", "TAKE.NS", "TNPL.NS", "TATACHEM.NS",
-        "TATACOFFEE.NS", "TCS.NS", "TATAELXSI.NS", "TATAGLOBAL.NS",
-        "TATAINVEST.NS", "TATAMTRDVR.NS", "TMPV.NS", "TATAPOWER.NS",
-        "TATASTEEL.NS", "TEAMLEASE.NS", "TECHM.NS", "NIACL.NS",
-        "RAMCOCEM.NS", "THERMAX.NS", "THOMASCOOK.NS", "THYROCARE.NS",
-        "TIMETECHNO.NS", "TIMKEN.NS", "TITAN.NS", "TORNTPHARM.NS",
-        "TORNTPOWER.NS", "TRENT.NS", "TRIDENT.NS", "TRITURBINE.NS",
-        "TIINDIA.NS", "UCOBANK.NS", "UFLEX.NS", "UPL.NS",
-        "UJJIVAN.NS", "ULTRACEMCO.NS", "UNIONBANK.NS", "UBL.NS",
-        "MCDOWELL-N.NS", "VGUARD.NS", "VMART.NS", "VIPIND.NS",
-        "VRLLOG.NS", "VSTIND.NS", "WABAG.NS", "VAKRANGEE.NS",
-        "VTL.NS", "VARROC.NS", "VBL.NS", "VEDL.NS",
-        "VENKEYS.NS", "VINATIORGA.NS", "IDEA.NS", "VOLTAS.NS",
-        "WABCOINDIA.NS", "WELCORP.NS", "WELSPUNIND.NS", "WHIRLPOOL.NS",
-        "WIPRO.NS", "WOCKPHARMA.NS", "YESBANK.NS", "ZEEL.NS",
-        "ZENSARTECH.NS", "ZYDUSWELL.NS", "ECLERX.NS",
-    ],
-
-    # All 28 major + cross forex pairs from the 8 most-traded currencies
-    # (AUD, USD, EUR, GBP, JPY, NZD, CAD, CHF) -- the standard "majors +
-    # crosses" set.
-    "FOREX": [
-        "EURUSD=X","GBPUSD=X","AUDUSD=X","NZDUSD=X","USDJPY=X","USDCAD=X","USDCHF=X",
-        "EURGBP=X","EURJPY=X","EURAUD=X","EURNZD=X","EURCAD=X","EURCHF=X",
-        "GBPJPY=X","GBPAUD=X","GBPNZD=X","GBPCAD=X","GBPCHF=X",
-        "AUDJPY=X","AUDNZD=X","AUDCAD=X","AUDCHF=X",
-        "NZDJPY=X","NZDCAD=X","NZDCHF=X",
-        "CADJPY=X","CADCHF=X",
-        "CHFJPY=X",
-    ],
+    "AUS": ["BHP.AX", "CBA.AX", "CSL.AX", "NAB.AX", "WBC.AX", "ANZ.AX", "WES.AX", "MQG.AX", "FMG.AX", "WDS.AX",
+            "TLS.AX", "RIO.AX", "WOW.AX", "GMG.AX", "TCL.AX", "COL.AX", "ALL.AX", "STO.AX", "QBE.AX", "SUN.AX",
+            "IAG.AX", "ORG.AX", "REA.AX", "XRO.AX", "COH.AX", "JBH.AX", "S32.AX", "ASX.AX", "BXB.AX", "WTC.AX",
+            "NST.AX", "EVN.AX", "MIN.AX", "PLS.AX", "SHL.AX", "RMD.AX", "FPH.AX", "QAN.AX", "ALD.AX", "AGL.AX"],
+    "US": ["AAPL", "MSFT", "NVDA", "GOOGL", "AMZN", "META", "TSLA", "AVGO", "JPM", "V", "MA", "XOM", "CVX", "UNH",
+           "LLY", "JNJ", "PG", "HD", "COST", "WMT", "BAC", "WFC", "GS", "MS", "NFLX", "AMD", "ORCL", "CRM", "ADBE",
+           "INTC", "QCOM", "TXN", "CAT", "DE", "BA", "GE", "HON", "UPS", "MCD", "NKE", "DIS", "KO", "PEP", "ABBV",
+           "MRK", "PFE", "TMO", "ABT", "LIN", "NEE", "SPY", "QQQ", "IWM"],
+    "INDIA": ["RELIANCE.NS", "TCS.NS", "HDFCBANK.NS", "INFY.NS", "ICICIBANK.NS", "HINDUNILVR.NS", "ITC.NS", "SBIN.NS",
+              "BHARTIARTL.NS", "KOTAKBANK.NS", "LT.NS", "AXISBANK.NS", "ASIANPAINT.NS", "MARUTI.NS", "SUNPHARMA.NS",
+              "TITAN.NS", "ULTRACEMCO.NS", "BAJFINANCE.NS", "NESTLEIND.NS", "WIPRO.NS", "HCLTECH.NS", "TATASTEEL.NS",
+              "NTPC.NS", "POWERGRID.NS", "ONGC.NS", "M&M.NS", "ADANIPORTS.NS", "JSWSTEEL.NS", "TECHM.NS",
+              "COALINDIA.NS", "DRREDDY.NS", "CIPLA.NS", "EICHERMOT.NS", "HINDALCO.NS", "BPCL.NS", "GRASIM.NS",
+              "BRITANNIA.NS", "DIVISLAB.NS", "APOLLOHOSP.NS", "INDUSINDBK.NS"],
+    "FOREX": ["EURUSD=X", "GBPUSD=X", "AUDUSD=X", "NZDUSD=X", "USDJPY=X", "USDCAD=X", "USDCHF=X", "EURGBP=X",
+              "EURJPY=X", "EURAUD=X", "EURNZD=X", "EURCAD=X", "EURCHF=X", "GBPJPY=X", "GBPAUD=X", "GBPNZD=X",
+              "GBPCAD=X", "GBPCHF=X", "AUDJPY=X", "AUDNZD=X", "AUDCAD=X", "AUDCHF=X", "NZDJPY=X", "NZDCAD=X",
+              "NZDCHF=X", "CADJPY=X", "CADCHF=X", "CHFJPY=X"],
 }
-
-# Suggested ZigZag deviation % per market / timeframe (starting points --
-# tune per-instrument once you see how it behaves in backtests).
-DEFAULT_DEVIATION = {
-    "AUS": 3.0, "US": 3.0, "INDIA": 3.0, "FOREX": 0.6,
-}
+DEFAULT_DEVIATION = {"AUS": 3.0, "US": 3.0, "INDIA": 3.0, "FOREX": 0.6}
