@@ -155,7 +155,7 @@ with tab_l:
 with tab_b:
     st.caption("Same engine as the live scanner. Pool several tickers: a single ticker produces too few trades to mean anything.")
     m = st.selectbox("Market", list(WATCHLISTS))
-    n = st.slider("Tickers to pool", 3, 40, 12)
+    n = st.slider("Tickers to pool (slow above ~60 -- use run_universe_backtest.py for all)", 3, len(WATCHLISTS[m]), min(25, len(WATCHLISTS[m])))
     period = st.selectbox("History", ["2y", "5y", "10y"], index=1) if config.SCAN_TIMEFRAMES[m] == "1d" else "730d"
     if st.button("Run pooled backtest"):
         from backtest import run_backtest, summarize

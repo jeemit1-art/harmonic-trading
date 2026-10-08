@@ -25,7 +25,7 @@ import correlation as corr
 import regime_filter as rf
 import news_filter as nf
 import telegram_alert as tg
-from data_sources import DEFAULT_SOURCE, WATCHLISTS
+from data_sources import DEFAULT_SOURCE, WATCHLISTS, is_dead, _load_health
 from patterns import find_patterns
 from engine import (evaluate_signal, build_plan, check_plan, new_position, advance_position,
                     atr_series, OPEN_STATES)
@@ -150,8 +150,9 @@ def run_scan(markets=None, dry=False, state_path=None) -> dict:
     markets = markets or list(WATCHLISTS.keys())
     for market in markets:
         tf, period = config.SCAN_TIMEFRAMES[market], config.SCAN_PERIOD[market]
-        tickers = WATCHLISTS[market]
-        _log(f"== {market}: {len(tickers)} tickers, {tf}, {period}")
+        health = _load_health()
+        tickers = [t for t in WATCHLISTS[market] if not is_dead(health, t)]
+        _log(f"== {market}: {len(tickers)} active of {len(WATCHLISTS[market])} listed, {tf}, {period}")
         try:
             data = DEFAULT_SOURCE.fetch_many(tickers, tf, period, market)
         except Exception as e:

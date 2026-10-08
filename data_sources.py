@@ -171,27 +171,5 @@ def _guess_market(t: str) -> str:
 DEFAULT_SOURCE = YFinanceSource()
 
 # ----------------------------------------------------------------------------- watchlists
-# CURATED for liquidity: harmonic structure on thin stocks is mostly noise, and v1's ~1,200-ticker
-# lists (several years stale, many delisted/renamed) made each run slow and rate-limited.
-# Verify tickers on Yahoo before relying on them -- I could not check them live.
-WATCHLISTS = {
-    "AUS": ["BHP.AX", "CBA.AX", "CSL.AX", "NAB.AX", "WBC.AX", "ANZ.AX", "WES.AX", "MQG.AX", "FMG.AX", "WDS.AX",
-            "TLS.AX", "RIO.AX", "WOW.AX", "GMG.AX", "TCL.AX", "COL.AX", "ALL.AX", "STO.AX", "QBE.AX", "SUN.AX",
-            "IAG.AX", "ORG.AX", "REA.AX", "XRO.AX", "COH.AX", "JBH.AX", "S32.AX", "ASX.AX", "BXB.AX", "WTC.AX",
-            "NST.AX", "EVN.AX", "MIN.AX", "PLS.AX", "SHL.AX", "RMD.AX", "FPH.AX", "QAN.AX", "ALD.AX", "AGL.AX"],
-    "US": ["AAPL", "MSFT", "NVDA", "GOOGL", "AMZN", "META", "TSLA", "AVGO", "JPM", "V", "MA", "XOM", "CVX", "UNH",
-           "LLY", "JNJ", "PG", "HD", "COST", "WMT", "BAC", "WFC", "GS", "MS", "NFLX", "AMD", "ORCL", "CRM", "ADBE",
-           "INTC", "QCOM", "TXN", "CAT", "DE", "BA", "GE", "HON", "UPS", "MCD", "NKE", "DIS", "KO", "PEP", "ABBV",
-           "MRK", "PFE", "TMO", "ABT", "LIN", "NEE", "SPY", "QQQ", "IWM"],
-    "INDIA": ["RELIANCE.NS", "TCS.NS", "HDFCBANK.NS", "INFY.NS", "ICICIBANK.NS", "HINDUNILVR.NS", "ITC.NS", "SBIN.NS",
-              "BHARTIARTL.NS", "KOTAKBANK.NS", "LT.NS", "AXISBANK.NS", "ASIANPAINT.NS", "MARUTI.NS", "SUNPHARMA.NS",
-              "TITAN.NS", "ULTRACEMCO.NS", "BAJFINANCE.NS", "NESTLEIND.NS", "WIPRO.NS", "HCLTECH.NS", "TATASTEEL.NS",
-              "NTPC.NS", "POWERGRID.NS", "ONGC.NS", "M&M.NS", "ADANIPORTS.NS", "JSWSTEEL.NS", "TECHM.NS",
-              "COALINDIA.NS", "DRREDDY.NS", "CIPLA.NS", "EICHERMOT.NS", "HINDALCO.NS", "BPCL.NS", "GRASIM.NS",
-              "BRITANNIA.NS", "DIVISLAB.NS", "APOLLOHOSP.NS", "INDUSINDBK.NS"],
-    "FOREX": ["EURUSD=X", "GBPUSD=X", "AUDUSD=X", "NZDUSD=X", "USDJPY=X", "USDCAD=X", "USDCHF=X", "EURGBP=X",
-              "EURJPY=X", "EURAUD=X", "EURNZD=X", "EURCAD=X", "EURCHF=X", "GBPJPY=X", "GBPAUD=X", "GBPNZD=X",
-              "GBPCAD=X", "GBPCHF=X", "AUDJPY=X", "AUDNZD=X", "AUDCAD=X", "AUDCHF=X", "NZDJPY=X", "NZDCAD=X",
-              "NZDCHF=X", "CADJPY=X", "CADCHF=X", "CHFJPY=X"],
-}
+from watchlists import WATCHLISTS  # noqa: E402  (full lists live in watchlists.py)
 DEFAULT_DEVIATION = {"AUS": 3.0, "US": 3.0, "INDIA": 3.0, "FOREX": 0.6}
